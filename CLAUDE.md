@@ -6,19 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 merchantGPT is a merchant-facing chatbot that replaces the admin section of common e-commerce platforms (WooCommerce, Magento, PrestaShop, Shopify, ...) for day-to-day operations: catalog, orders, customers, reporting and sales analysis. It is a standalone native Rust desktop application for Linux, macOS and Windows. A browser/WASM build was considered and dropped: calling platform admin APIs from a browser origin hits CORS and some platforms refuse it outright. There is no login: shops are identified by their URL, several shops can be managed with a switcher, and platform API credentials are entered through the `+` connector flow.
 
-## Toolchain rule: everything runs in Docker
+## Toolchains: Docker for the Linux gate, the macOS host for running the app
 
-No Rust toolchain is installed on the host and none must be installed. Every build, test, lint and run goes through a container. `docker-compose.yml` defines a `dev` service built from the repo `Dockerfile` (official `rust:1-bookworm` image plus eframe's Linux build deps, libdbus for the keyring, and cmake/perl for vendored SQLCipher), with the repo mounted at `/app` and named volumes for `target/` and the cargo registry/git caches so incremental builds survive container restarts. Add dependencies with `docker compose run --rm dev cargo add <crate> -p <member>` so versions are resolved in the container.
+Two toolchains, same Rust version (1.99.1):
 
-The GUI cannot be displayed from inside the container on a macOS host, so `cargo run` is not part of the dev loop; the oracle is build, tests, clippy and fmt. The container produces a Linux binary only.
+- **Docker (`dev` service)** is the Linux build and the quality gate. `docker-compose.yml` builds it from the repo `Dockerfile` (official `rust:1-bookworm` image plus eframe's Linux build deps, libdbus for the keyring, and cmake/perl for vendored SQLCipher), mounts the repo at `/app`, and keeps `target/` and the cargo caches in named volumes. Add dependencies with `docker compose run --rm dev cargo add <crate> -p <member>`.
+- **The macOS host** builds and runs the native GUI, since the container cannot display a window. The machine's global rustup default is an old x86_64 toolchain used by other projects, so this repo is pinned with a per-directory override (machine-local state, not in git): `rustup override set 1.99.1-aarch64-apple-darwin`. Never change the global default. Host builds write to `./target`, separate from the container's volume.
 
-Never run `cargo`, `rustup` or similar directly on the host, not even to check a version.
+Ad-hoc-signed rebuilds change the binary's identity, so macOS may ask to allow keychain access to the `merchantgpt` / `db-key` item after a rebuild; choose "Always Allow". Denying it leaves the app on its "could not start" screen.
 
 ## Commands
 
 When piping cargo output through `grep`/`head`, the pipeline's exit code is the filter's, not cargo's. Use `scripts/check.sh` (it sets `pipefail`) as the source of truth.
 
 ```bash
+# macOS host: native build and run (window opens on your desktop)
+cargo build --release && ./target/release/merchantgpt
+cargo test                                             # also passes natively
+
+# Docker: Linux build and the full gate
 docker compose build                                   # (re)build the dev image
 docker compose run --rm dev bash scripts/check.sh      # full gate: build, test, clippy -D warnings, fmt --check
 docker compose run --rm dev cargo build                # native debug build
@@ -82,4 +88,4 @@ tools  <-  connectors, llm, skills, store  <-  chat-core  <-  app
 
 ## Open decisions
 
-- **Native cross-compilation.** How macOS and Windows binaries are produced from the Linux container (cross images, CI matrix, or similar).
+- **Windows builds and distribution.** macOS builds natively on the host; Windows needs either a CI runner or a cross toolchain. Shareable builds go only to the `tech-ai-tools` S3 bucket.
