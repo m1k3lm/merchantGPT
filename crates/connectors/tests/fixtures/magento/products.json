@@ -1,0 +1,10 @@
+{
+  "items": [
+    {"id": 11, "sku": "HOOD-BLU", "name": "Blue Hoodie", "attribute_set_id": 4, "price": 42, "status": 1,
+     "visibility": 4, "type_id": "simple",
+     "custom_attributes": [{"attribute_code": "special_price", "value": "35.500000"}, {"attribute_code": "url_key", "value": "blue-hoodie"}]},
+    {"id": 12, "sku": "HOOD-RED", "name": "Red Hoodie", "price": 44.5, "status": 2, "type_id": "simple", "custom_attributes": []}
+  ],
+  "search_criteria": {"filter_groups": [], "page_size": 2, "current_page": 1},
+  "total_count": 3
+}

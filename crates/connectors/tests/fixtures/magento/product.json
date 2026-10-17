@@ -1,0 +1,3 @@
+{"id": 11, "sku": "HOOD-BLU", "name": "Blue Hoodie", "price": 39.9, "status": 1, "type_id": "simple",
+ "extension_attributes": {"website_ids": [1], "stock_item": {"item_id": 11, "product_id": 11, "qty": 7, "is_in_stock": true}},
+ "custom_attributes": []}

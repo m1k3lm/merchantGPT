@@ -32,11 +32,22 @@ impl CredentialField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialSchema {
     fields: Vec<CredentialField>,
+    help: Option<&'static str>,
 }
 
 impl CredentialSchema {
     pub fn new(fields: Vec<CredentialField>) -> Self {
-        Self { fields }
+        Self { fields, help: None }
+    }
+
+    /// Where the merchant finds these credentials, shown under the form.
+    pub fn with_help(mut self, help: &'static str) -> Self {
+        self.help = Some(help);
+        self
+    }
+
+    pub fn help(&self) -> Option<&'static str> {
+        self.help
     }
 
     pub fn fields(&self) -> &[CredentialField] {

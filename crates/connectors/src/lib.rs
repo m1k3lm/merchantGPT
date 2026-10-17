@@ -2,6 +2,7 @@
 //! shop platforms are one kind, ad platforms and carriers are future kinds.
 
 pub mod domain;
+pub mod magento;
 pub mod platform;
 pub mod registry;
 pub mod schema;

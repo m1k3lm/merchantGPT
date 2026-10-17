@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::magento::Magento;
 use crate::schema::CredentialField as F;
 use crate::shop::ShopConnectorAdapter;
 use crate::stub::StubShop;
@@ -12,6 +13,8 @@ use crate::{
 /// The single place that knows every connector kind: what credentials it needs
 /// and how to build it. The UI and core only go through this.
 pub struct ConnectorRegistry;
+
+const MAGENTO_HELP: &str = "In the Magento admin: System > Integrations > Add New Integration, give it API access to Catalog, Sales and Customers, save, then Activate and copy the Access Token. On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > \"Allow OAuth Access Tokens to be used as standalone Bearer tokens\" to Yes.";
 
 impl ConnectorRegistry {
     pub fn kinds() -> Vec<ConnectorKind> {
@@ -26,6 +29,7 @@ impl ConnectorRegistry {
             ]),
             ConnectorKind::Shop(Platform::Magento) => {
                 CredentialSchema::new(vec![F::secret("access_token", "Integration access token")])
+                    .with_help(MAGENTO_HELP)
             }
             ConnectorKind::Shop(Platform::PrestaShop) => {
                 CredentialSchema::new(vec![F::secret("webservice_key", "Webservice key")])
@@ -52,6 +56,9 @@ impl ConnectorRegistry {
         let shop: Arc<dyn crate::ShopConnector> = match kind {
             ConnectorKind::Shop(Platform::WooCommerce) => {
                 Arc::new(WooCommerce::new(base_url, credentials, transport))
+            }
+            ConnectorKind::Shop(Platform::Magento) => {
+                Arc::new(Magento::new(base_url, credentials, transport))
             }
             ConnectorKind::Shop(p) => Arc::new(StubShop(p)),
         };

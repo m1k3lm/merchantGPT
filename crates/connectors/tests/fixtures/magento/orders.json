@@ -1,0 +1,16 @@
+{
+  "items": [
+    {"entity_id": 41, "increment_id": "000000041", "status": "processing", "state": "processing",
+     "order_currency_code": "EUR", "grand_total": 84.5, "subtotal": 80, "created_at": "2026-10-15 10:12:00",
+     "customer_is_guest": 1, "customer_email": "ana@example.com",
+     "billing_address": {"firstname": "Ana", "lastname": "García"},
+     "items": [
+       {"item_id": 1, "product_id": 20, "name": "Hoodie (configurable)", "qty_ordered": 2, "row_total": 80, "product_type": "configurable"},
+       {"item_id": 2, "product_id": 21, "name": "Hoodie XL", "qty_ordered": 2, "row_total": 0, "parent_item_id": 1}
+     ]},
+    {"entity_id": 42, "increment_id": "000000042", "status": "pending", "order_currency_code": "EUR",
+     "grand_total": "10.0000", "created_at": "2026-10-16 08:00:00", "customer_is_guest": 0, "customer_id": 12,
+     "customer_firstname": "Jo", "customer_lastname": "Smith", "customer_email": "jo@example.com", "items": []}
+  ],
+  "total_count": 2
+}

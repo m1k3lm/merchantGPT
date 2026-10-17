@@ -1382,7 +1382,7 @@ mod tests {
     async fn audit_row_written_for_mutation() {
         let mut f = fixture();
         f.configure().await;
-        f.connect("shop.test", Platform::Magento).await;
+        f.connect("shop.test", Platform::PrestaShop).await;
         f.provider
             .push_tool_call(
                 "c1",
@@ -1415,7 +1415,7 @@ mod tests {
         let shop_a = f.backend.active_shop_id().unwrap();
         f.send("about A").await;
         let conv_a = f.backend.conversation_id().unwrap();
-        f.connect("b.test", Platform::Magento).await;
+        f.connect("b.test", Platform::PrestaShop).await;
         assert_eq!(f.backend.conversation_id(), None, "new shop starts fresh");
         f.send("about B").await;
 
@@ -1436,7 +1436,7 @@ mod tests {
         f.configure().await;
         f.connect("a.test", Platform::Shopify).await;
         let shop_a = f.backend.active_shop_id().unwrap();
-        f.connect("b.test", Platform::Magento).await;
+        f.connect("b.test", Platform::PrestaShop).await;
         f.backend.handle(Command::SelectShop(shop_a)).await;
         f.provider
             .push_tool_call("c", "shop_list_orders", json!({}))
@@ -1563,7 +1563,7 @@ mod tests {
 
     async fn shop_with_task(f: &mut Fixture, schedule: &str) -> i64 {
         f.configure().await;
-        f.connect("a.test", Platform::Magento).await;
+        f.connect("a.test", Platform::PrestaShop).await;
         f.backend
             .handle(Command::CreateTask {
                 name: "Morning".into(),
@@ -1663,7 +1663,7 @@ mod tests {
         assert!(
             matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("Connect a shop"))
         );
-        f.connect("a.test", Platform::Magento).await;
+        f.connect("a.test", Platform::PrestaShop).await;
         f.backend
             .handle(Command::CreateTask {
                 name: "x".into(),
@@ -1705,7 +1705,7 @@ mod tests {
     async fn audit_log_is_listed_for_the_active_shop() {
         let mut f = fixture();
         f.configure().await;
-        f.connect("shop.test", Platform::Magento).await;
+        f.connect("shop.test", Platform::PrestaShop).await;
         f.provider
             .push_tool_call(
                 "c1",

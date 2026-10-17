@@ -738,6 +738,10 @@ impl App {
                             let value = values.entry(field.key.to_string()).or_default();
                             ui.add(egui::TextEdit::singleline(value).password(field.secret));
                         }
+                        if let Some(help) = schema.help() {
+                            ui.add_space(4.0);
+                            ui.add(egui::Label::new(RichText::new(help).weak().small()).wrap());
+                        }
                         let complete = !url.trim().is_empty() && schema.missing(values).is_empty();
                         ui.horizontal(|ui| {
                             if ui
