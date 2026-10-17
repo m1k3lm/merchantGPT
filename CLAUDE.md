@@ -16,8 +16,11 @@ Never run `cargo`, `rustup` or similar directly on the host, not even to check a
 
 ## Commands
 
+When piping cargo output through `grep`/`head`, the pipeline's exit code is the filter's, not cargo's. Use `scripts/check.sh` (it sets `pipefail`) as the source of truth.
+
 ```bash
 docker compose build                                   # (re)build the dev image
+docker compose run --rm dev bash scripts/check.sh      # full gate: build, test, clippy -D warnings, fmt --check
 docker compose run --rm dev cargo build                # native debug build
 docker compose run --rm dev cargo build --release
 docker compose run --rm dev cargo test                 # all tests

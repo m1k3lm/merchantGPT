@@ -148,6 +148,16 @@ impl ProviderId {
         }
     }
 
+    /// Pre-filled in the settings form; the merchant can type any model id.
+    pub fn suggested_model(self) -> &'static str {
+        match self {
+            ProviderId::OpenAi => "gpt-5",
+            ProviderId::Anthropic => "claude-sonnet-5-5",
+            ProviderId::Google => "gemini-2.5-pro",
+            ProviderId::DeepSeek => "deepseek-chat",
+        }
+    }
+
     pub fn default_base_url(self) -> &'static str {
         match self {
             ProviderId::OpenAi => "https://api.openai.com/v1",
