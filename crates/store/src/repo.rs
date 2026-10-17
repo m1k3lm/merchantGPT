@@ -28,6 +28,8 @@ pub struct LlmSettingsRow {
     pub base_url: Option<String>,
     pub model: String,
     pub active: bool,
+    /// Provider-specific values; may contain secrets (e.g. an AWS session token).
+    pub options: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for LlmSettingsRow {
@@ -38,6 +40,7 @@ impl std::fmt::Debug for LlmSettingsRow {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("active", &self.active)
+            .field("options", &self.options.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -245,12 +248,14 @@ impl Store {
         if s.active {
             tx.execute("UPDATE llm_settings SET active = 0", [])?;
         }
+        let options =
+            serde_json::to_string(&s.options).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         tx.execute(
-            "INSERT INTO llm_settings (provider, api_key, base_url, model, active, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO llm_settings (provider, api_key, base_url, model, active, updated_at, options)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(provider) DO UPDATE SET api_key = ?2, base_url = ?3, model = ?4,
-                 active = ?5, updated_at = ?6",
-            params![s.provider, s.api_key, s.base_url, s.model, s.active, now()],
+                 active = ?5, updated_at = ?6, options = ?7",
+            params![s.provider, s.api_key, s.base_url, s.model, s.active, now(), options],
         )?;
         tx.commit()?;
         Ok(())
@@ -259,20 +264,31 @@ impl Store {
     pub fn llm_settings(&self) -> Result<Vec<LlmSettingsRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT provider, api_key, base_url, model, active FROM llm_settings ORDER BY provider",
+            "SELECT provider, api_key, base_url, model, active, options FROM llm_settings ORDER BY provider",
         )?;
-        let rows = stmt
+        let raw: Vec<(LlmSettingsRow, String)> = stmt
             .query_map([], |r| {
-                Ok(LlmSettingsRow {
-                    provider: r.get(0)?,
-                    api_key: r.get(1)?,
-                    base_url: r.get(2)?,
-                    model: r.get(3)?,
-                    active: r.get(4)?,
-                })
+                Ok((
+                    LlmSettingsRow {
+                        provider: r.get(0)?,
+                        api_key: r.get(1)?,
+                        base_url: r.get(2)?,
+                        model: r.get(3)?,
+                        active: r.get(4)?,
+                        options: BTreeMap::new(),
+                    },
+                    r.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
+        raw.into_iter()
+            .map(|(mut row, json)| {
+                row.options = serde_json::from_str(&json).map_err(|e| {
+                    StoreError::Corrupt(format!("options for {}: {e}", row.provider))
+                })?;
+                Ok(row)
+            })
+            .collect()
     }
 
     pub fn active_llm(&self) -> Result<Option<LlmSettingsRow>> {
@@ -544,6 +560,7 @@ mod tests {
     fn only_one_llm_setting_is_active() {
         let s = store();
         let row = |p: &str, active| LlmSettingsRow {
+            options: BTreeMap::from([("region".to_string(), "eu-west-1".to_string())]),
             provider: p.into(),
             api_key: "k".into(),
             base_url: None,
@@ -553,6 +570,10 @@ mod tests {
         s.save_llm_settings(&row("openai", true)).unwrap();
         s.save_llm_settings(&row("anthropic", true)).unwrap();
         assert_eq!(s.active_llm().unwrap().unwrap().provider, "anthropic");
+        assert_eq!(
+            s.active_llm().unwrap().unwrap().options["region"],
+            "eu-west-1"
+        );
         assert_eq!(s.llm_settings().unwrap().len(), 2);
         assert!(!format!("{:?}", row("x", true)).contains("\"k\""));
     }

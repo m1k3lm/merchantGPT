@@ -119,6 +119,10 @@ pub struct LlmSettingSummary {
     pub model: String,
     pub base_url: Option<String>,
     pub active: bool,
+    /// Non-secret provider options (e.g. Bedrock region, AWS key id).
+    pub options: std::collections::BTreeMap<String, String>,
+    /// Whether secret options (e.g. an AWS session token) are saved.
+    pub has_secret_options: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -314,18 +318,21 @@ impl Backend {
 
     /// The LLM key plus every secret credential field of every saved shop.
     fn redactor(&self) -> Redactor {
-        let mut secrets: Vec<String> = self
-            .llm
-            .iter()
-            .map(|(cfg, _)| cfg.api_key.clone())
-            .collect();
-        secrets.extend(
-            self.store
-                .llm_settings()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| r.api_key),
-        );
+        let secret_options = |opts: &std::collections::BTreeMap<String, String>| {
+            opts.iter()
+                .filter(|(k, _)| llm::is_secret_option(k))
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut secrets: Vec<String> = Vec::new();
+        if let Some((cfg, _)) = &self.llm {
+            secrets.push(cfg.api_key.clone());
+            secrets.extend(secret_options(&cfg.options));
+        }
+        for r in self.store.llm_settings().unwrap_or_default() {
+            secrets.extend(secret_options(&r.options));
+            secrets.push(r.api_key);
+        }
         for shop in self.store.list_shops().unwrap_or_default() {
             for row in self.store.credentials(shop.id).unwrap_or_default() {
                 let Some(kind) = ConnectorKind::parse(&row.kind) else {
@@ -436,6 +443,7 @@ impl Backend {
             match ProviderId::parse(&row.provider) {
                 Some(provider) => {
                     let cfg = ProviderConfig {
+                        options: row.options,
                         provider,
                         api_key: row.api_key,
                         base_url: row.base_url,
@@ -471,6 +479,7 @@ impl Backend {
                     base_url: cfg.base_url.clone(),
                     model: cfg.model.clone(),
                     active: true,
+                    options: cfg.options.clone(),
                 })
                 .map_err(err)?;
             self.emit_llm_settings()?;
@@ -484,17 +493,35 @@ impl Backend {
     }
 
     /// A blank key in the form means "keep the saved one for this provider".
+    /// The form never shows saved secrets, so a blank secret field means
+    /// "keep the saved one" (for options, only while the AWS key id is unchanged).
     fn with_saved_key(&self, mut cfg: ProviderConfig) -> Res<ProviderConfig> {
+        // A secret belongs to its AWS key id; never pair it with another one.
+        let saved = self
+            .store
+            .llm_settings()
+            .map_err(err)?
+            .into_iter()
+            .find(|r| r.provider == cfg.provider.id())
+            .filter(|r| {
+                r.options.get(llm::OPT_AWS_ACCESS_KEY_ID)
+                    == cfg.options.get(llm::OPT_AWS_ACCESS_KEY_ID)
+            });
         if cfg.api_key.trim().is_empty() {
-            cfg.api_key = self
-                .store
-                .llm_settings()
-                .map_err(err)?
-                .into_iter()
-                .find(|r| r.provider == cfg.provider.id())
-                .map(|r| r.api_key)
+            cfg.api_key = saved
+                .as_ref()
+                .map(|r| r.api_key.clone())
                 .ok_or_else(|| format!("Enter an API key for {}.", cfg.provider.display_name()))?;
         }
+        if let Some(saved) = &saved {
+            for (k, v) in &saved.options {
+                let blank = cfg.options.get(k).is_none_or(|x| x.trim().is_empty());
+                if llm::is_secret_option(k) && blank {
+                    cfg.options.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        cfg.options.retain(|_, v| !v.trim().is_empty());
         Ok(cfg)
     }
 
@@ -508,6 +535,12 @@ impl Backend {
                     model: r.model,
                     base_url: r.base_url,
                     active: r.active,
+                    has_secret_options: r.options.keys().any(|k| llm::is_secret_option(k)),
+                    options: r
+                        .options
+                        .into_iter()
+                        .filter(|(k, _)| !llm::is_secret_option(k))
+                        .collect(),
                 })
             })
             .collect();
@@ -1161,6 +1194,7 @@ mod tests {
 
     fn llm_cfg() -> ProviderConfig {
         ProviderConfig {
+            options: Default::default(),
             provider: ProviderId::OpenAi,
             api_key: "k".into(),
             base_url: None,
@@ -1256,6 +1290,80 @@ mod tests {
         other.api_key = String::new();
         f.backend.handle(Command::SetLlm(other)).await;
         assert!(matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("API key")));
+    }
+
+    #[tokio::test]
+    async fn bedrock_options_persist_and_blank_secrets_keep_saved_ones() {
+        let mut f = fixture();
+        let bedrock = |key: &str, akid: &str, token: &str| ProviderConfig {
+            provider: ProviderId::Bedrock,
+            api_key: key.into(),
+            base_url: None,
+            model: "anthropic.claude-opus-5-5".into(),
+            options: [
+                (llm::OPT_REGION, "eu-west-1"),
+                (llm::OPT_AWS_ACCESS_KEY_ID, akid),
+                (llm::OPT_AWS_SESSION_TOKEN, token),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        };
+        f.backend
+            .handle(Command::SetLlm(bedrock(
+                "aws-secret",
+                "AKIA1",
+                "tok-123456",
+            )))
+            .await;
+        f.backend
+            .handle(Command::SetLlm(bedrock("", "AKIA1", "")))
+            .await;
+        let row = f.store.active_llm().unwrap().unwrap();
+        assert_eq!(row.api_key, "aws-secret");
+        assert_eq!(row.options[llm::OPT_AWS_SESSION_TOKEN], "tok-123456");
+        assert_eq!(row.options[llm::OPT_REGION], "eu-west-1");
+
+        f.backend
+            .handle(Command::SetLlm(bedrock("", "AKIA2", "")))
+            .await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("API key")),
+            "the old secret is not paired with a new key id"
+        );
+        f.backend
+            .handle(Command::SetLlm(bedrock("aws-secret-2", "AKIA2", "")))
+            .await;
+        let row = f.store.active_llm().unwrap().unwrap();
+        assert!(
+            !row.options.contains_key(llm::OPT_AWS_SESSION_TOKEN),
+            "a token is not reused for a different key id"
+        );
+
+        let summary = f
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                BackendEvent::LlmSettings(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary[0].options[llm::OPT_AWS_ACCESS_KEY_ID], "AKIA2");
+        assert!(!summary[0].options.contains_key(llm::OPT_AWS_SESSION_TOKEN));
+
+        f.backend
+            .handle(Command::SetLlm(bedrock(
+                "aws-secret",
+                "AKIA1",
+                "tok-123456",
+            )))
+            .await;
+        f.backend
+            .emit(BackendEvent::Error("bad token tok-123456".into()));
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e == "bad token [redacted]")
+        );
     }
 
     #[tokio::test]

@@ -84,6 +84,7 @@ async fn agent_reads_and_changes_a_live_store() {
     );
     backend
         .handle(Command::SetLlm(ProviderConfig {
+            options: Default::default(),
             provider: ProviderId::OpenAi,
             api_key: "unused-key".into(),
             base_url: None,

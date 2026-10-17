@@ -17,7 +17,7 @@ use crate::{
     StopReason, StreamEvent, ToolCall, ToolChoice, Usage,
 };
 
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// Models that accept `fallbacks: "default"` on the Claude API.
 const FALLBACK_MODELS: &[&str] = &[
@@ -42,8 +42,8 @@ impl AnthropicProvider {
 pub(crate) struct Options {
     /// Server-side refusal fallbacks; only on the official endpoint, since a
     /// proxy may reject the beta field.
-    pub fallbacks: bool,
-    pub eager_input_streaming: bool,
+    pub(crate) fallbacks: bool,
+    pub(crate) eager_input_streaming: bool,
 }
 
 impl Options {
@@ -65,7 +65,7 @@ impl LlmProvider for AnthropicProvider {
     async fn stream(&self, req: ChatRequest) -> Result<EventStream, LlmError> {
         let url = format!("{}/v1/messages", self.cfg.base_url());
         let opts = Options::for_config(&self.cfg);
-        let body = encode(&req, opts);
+        let body = encode(&req, opts, ProviderId::Anthropic);
         let resp = send_with_retry(|| {
             let mut b = self
                 .http
@@ -104,7 +104,8 @@ fn push(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
     messages.push(json!({"role": role, "content": blocks}));
 }
 
-pub(crate) fn encode(req: &ChatRequest, opts: Options) -> Value {
+/// `replay` is the provider whose raw content blocks may be replayed verbatim.
+pub(crate) fn encode(req: &ChatRequest, opts: Options, replay: ProviderId) -> Value {
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for m in &req.messages {
@@ -118,7 +119,7 @@ pub(crate) fn encode(req: &ChatRequest, opts: Options) -> Value {
             } => {
                 let replay = provider_content
                     .as_ref()
-                    .filter(|p| p.provider == ProviderId::Anthropic)
+                    .filter(|p| p.provider == replay)
                     .and_then(|p| p.content.as_array().cloned());
                 let blocks = replay.unwrap_or_else(|| {
                     let mut b = Vec::new();
@@ -545,6 +546,7 @@ mod tests {
                 ChatMessage::user("and now?"),
             ]),
             opts(),
+            ProviderId::Anthropic,
         );
         assert_eq!(body["system"], "sys");
         let msgs = body["messages"].as_array().unwrap();
@@ -571,7 +573,11 @@ mod tests {
                 content: raw.clone(),
             });
         }
-        let body = encode(&req(vec![ChatMessage::user("x"), msg.clone()]), opts());
+        let body = encode(
+            &req(vec![ChatMessage::user("x"), msg.clone()]),
+            opts(),
+            ProviderId::Anthropic,
+        );
         assert_eq!(body["messages"][1]["content"], raw);
 
         if let ChatMessage::Assistant {
@@ -581,7 +587,11 @@ mod tests {
         {
             p.provider = ProviderId::Google;
         }
-        let body = encode(&req(vec![ChatMessage::user("x"), msg]), opts());
+        let body = encode(
+            &req(vec![ChatMessage::user("x"), msg]),
+            opts(),
+            ProviderId::Anthropic,
+        );
         assert_eq!(
             body["messages"][1]["content"],
             json!([{"type": "text", "text": "hi"}])
@@ -591,6 +601,7 @@ mod tests {
     #[test]
     fn official_endpoint_enables_fallbacks_and_eager_streaming() {
         let cfg = |model: &str, base: Option<&str>| ProviderConfig {
+            options: Default::default(),
             provider: ProviderId::Anthropic,
             api_key: "k".into(),
             base_url: base.map(str::to_string),
@@ -604,7 +615,7 @@ mod tests {
 
         let mut r = req(vec![ChatMessage::user("x")]);
         r.tool_choice = ToolChoice::None;
-        let body = encode(&r, o);
+        let body = encode(&r, o, ProviderId::Anthropic);
         assert_eq!(body["fallbacks"], "default");
         assert_eq!(body["tools"][0]["eager_input_streaming"], true);
         assert_eq!(body["tool_choice"], json!({"type": "none"}));

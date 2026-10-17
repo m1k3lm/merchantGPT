@@ -7,6 +7,7 @@ mod state;
 use chat_core::{Command, Credentials};
 use connectors::{ConnectorKind, ConnectorRegistry, Platform};
 use eframe::egui::{self, Color32, RichText};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use llm::{ProviderConfig, ProviderId};
 use runtime::Runtime;
 use state::{pretty_args, AppState, CardState, ChatItem, ToolStatus};
@@ -76,7 +77,13 @@ struct SettingsForm {
     provider: ProviderId,
     model: String,
     base_url: String,
+    /// API key, Bedrock API key, or AWS secret access key.
     api_key: String,
+    region: String,
+    /// Bedrock: sign with AWS access keys instead of a Bedrock API key.
+    aws_access_keys: bool,
+    access_key_id: String,
+    session_token: String,
 }
 
 impl Default for SettingsForm {
@@ -87,11 +94,56 @@ impl Default for SettingsForm {
             model: String::new(),
             base_url: String::new(),
             api_key: String::new(),
+            region: "us-east-1".into(),
+            aws_access_keys: false,
+            access_key_id: String::new(),
+            session_token: String::new(),
         }
     }
 }
 
+impl SettingsForm {
+    fn options(&self) -> std::collections::BTreeMap<String, String> {
+        let mut o = std::collections::BTreeMap::new();
+        if self.provider == ProviderId::Bedrock {
+            o.insert(llm::OPT_REGION.to_string(), self.region.trim().to_string());
+            if self.aws_access_keys {
+                o.insert(
+                    llm::OPT_AWS_ACCESS_KEY_ID.to_string(),
+                    self.access_key_id.trim().to_string(),
+                );
+                o.insert(
+                    llm::OPT_AWS_SESSION_TOKEN.to_string(),
+                    self.session_token.trim().to_string(),
+                );
+            }
+        }
+        o.retain(|_, v| !v.is_empty());
+        o
+    }
+
+    /// The backend reuses a saved secret only for the same AWS key id.
+    fn saved_secret_applies(&self, saved: Option<&chat_core::LlmSettingSummary>) -> bool {
+        saved.is_some_and(|s| {
+            s.options
+                .get(llm::OPT_AWS_ACCESS_KEY_ID)
+                .map(String::as_str)
+                == self
+                    .options()
+                    .get(llm::OPT_AWS_ACCESS_KEY_ID)
+                    .map(String::as_str)
+        })
+    }
+
+    fn base_url_hint(&self) -> String {
+        self.provider
+            .default_base_url()
+            .replace("{region}", self.region.trim())
+    }
+}
+
 struct App {
+    markdown: CommonMarkCache,
     audit_open: bool,
     runtime: Result<Runtime, String>,
     state: AppState,
@@ -104,6 +156,7 @@ struct App {
 impl App {
     fn new(runtime: Result<Runtime, String>) -> Self {
         Self {
+            markdown: CommonMarkCache::default(),
             audit_open: false,
             runtime,
             state: AppState::default(),
@@ -132,10 +185,20 @@ impl App {
         let s = &mut self.settings;
         s.provider = provider;
         s.api_key.clear();
+        s.session_token.clear();
         match self.state.saved_llm(provider) {
             Some(saved) => {
                 s.model = saved.model.clone();
                 s.base_url = saved.base_url.clone().unwrap_or_default();
+                if let Some(r) = saved.options.get(llm::OPT_REGION) {
+                    s.region = r.clone();
+                }
+                s.access_key_id = saved
+                    .options
+                    .get(llm::OPT_AWS_ACCESS_KEY_ID)
+                    .cloned()
+                    .unwrap_or_default();
+                s.aws_access_keys = !s.access_key_id.is_empty();
             }
             None => {
                 let defaults = self.runtime.as_ref().ok().map(|r| &r.config.llm);
@@ -440,7 +503,7 @@ impl App {
                     ui.weak("Connect your shop with the + button and configure an AI provider in Settings, then ask anything about your store. Type / to run a skill.");
                 }
                 for (idx, item) in self.state.items.iter().enumerate() {
-                    render_item(ui, idx, item, &mut answers);
+                    render_item(ui, idx, item, &mut answers, &mut self.markdown);
                     ui.add_space(8.0);
                 }
                 if self.state.busy {
@@ -462,7 +525,9 @@ impl App {
         let mut open = true;
         let mut save = false;
         let mut switch_to = None;
-        let has_saved_key = self.state.saved_llm(self.settings.provider).is_some();
+        let saved = self.state.saved_llm(self.settings.provider).cloned();
+        let has_saved_key = self.settings.saved_secret_applies(saved.as_ref());
+        let has_saved_token = has_saved_key && saved.as_ref().is_some_and(|s| s.has_secret_options);
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -487,28 +552,62 @@ impl App {
                         ui.label("Model");
                         ui.text_edit_singleline(&mut s.model);
                         ui.end_row();
-                        ui.label("API key");
-                        let hint = if has_saved_key {
-                            "saved; leave blank to keep"
+                        let saved_hint = |saved: bool| if saved { "saved; leave blank to keep" } else { "" };
+                        if s.provider == ProviderId::Bedrock {
+                            ui.label("AWS region");
+                            ui.add(egui::TextEdit::singleline(&mut s.region).hint_text("us-east-1"));
+                            ui.end_row();
+                            ui.label("Authentication");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut s.aws_access_keys, false, "Bedrock API key");
+                                ui.radio_value(&mut s.aws_access_keys, true, "AWS access keys");
+                            });
+                            ui.end_row();
+                            if s.aws_access_keys {
+                                ui.label("Access key ID");
+                                ui.text_edit_singleline(&mut s.access_key_id);
+                                ui.end_row();
+                                ui.label("Secret access key");
+                            } else {
+                                ui.label("Bedrock API key");
+                            }
                         } else {
-                            ""
-                        };
+                            ui.label("API key");
+                        }
                         ui.add(
                             egui::TextEdit::singleline(&mut s.api_key)
                                 .password(true)
-                                .hint_text(hint),
+                                .hint_text(saved_hint(has_saved_key)),
                         );
                         ui.end_row();
+                        if s.provider == ProviderId::Bedrock && s.aws_access_keys {
+                            ui.label("Session token");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut s.session_token)
+                                    .password(true)
+                                    .hint_text(if has_saved_token {
+                                        "saved; leave blank to keep"
+                                    } else {
+                                        "only for temporary credentials"
+                                    }),
+                            );
+                            ui.end_row();
+                        }
                         ui.label("Base URL");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut s.base_url)
-                                .hint_text(s.provider.default_base_url()),
-                        );
+                        let hint = s.base_url_hint();
+                        ui.add(egui::TextEdit::singleline(&mut s.base_url).hint_text(hint));
                         ui.end_row();
                     });
+                if s.provider == ProviderId::Bedrock {
+                    ui.weak("Claude in Amazon Bedrock: model ids start with \"anthropic.\". Temporary credentials expire; paste new ones when they do.");
+                }
                 ui.weak("Keys are stored in the encrypted local database, never in config.toml.");
-                let ready =
-                    !s.model.trim().is_empty() && (has_saved_key || !s.api_key.trim().is_empty());
+                let bedrock_ok = s.provider != ProviderId::Bedrock
+                    || (!s.region.trim().is_empty()
+                        && (!s.aws_access_keys || !s.access_key_id.trim().is_empty()));
+                let ready = bedrock_ok
+                    && !s.model.trim().is_empty()
+                    && (has_saved_key || !s.api_key.trim().is_empty());
                 if ui.add_enabled(ready, egui::Button::new("Save")).clicked() {
                     save = true;
                 }
@@ -519,12 +618,14 @@ impl App {
         if save {
             let s = &self.settings;
             self.send(Command::SetLlm(ProviderConfig {
+                options: s.options(),
                 provider: s.provider,
                 api_key: s.api_key.trim().to_string(),
                 base_url: Some(s.base_url.trim().to_string()).filter(|u| !u.is_empty()),
                 model: s.model.trim().to_string(),
             }));
             self.settings.api_key.clear();
+            self.settings.session_token.clear();
             open = false;
         }
         self.settings.open = open;
@@ -790,7 +891,13 @@ impl App {
     }
 }
 
-fn render_item(ui: &mut egui::Ui, idx: usize, item: &ChatItem, answers: &mut Vec<(usize, bool)>) {
+fn render_item(
+    ui: &mut egui::Ui,
+    idx: usize,
+    item: &ChatItem,
+    answers: &mut Vec<(usize, bool)>,
+    markdown: &mut CommonMarkCache,
+) {
     match item {
         ChatItem::User(text) => {
             ui.label(RichText::new("You").strong());
@@ -798,7 +905,7 @@ fn render_item(ui: &mut egui::Ui, idx: usize, item: &ChatItem, answers: &mut Vec
         }
         ChatItem::Assistant(text) => {
             ui.label(RichText::new("merchantGPT").strong().color(BLUE));
-            ui.label(text);
+            render_markdown(ui, idx, text, markdown);
         }
         ChatItem::Tool {
             name,
@@ -865,6 +972,58 @@ fn render_item(ui: &mut egui::Ui, idx: usize, item: &ChatItem, answers: &mut Vec
         }
         ChatItem::Error(text) => {
             ui.colored_label(RED, text);
+        }
+    }
+}
+
+/// Assistant replies are Markdown (tables, lists, code). Each message gets its
+/// own id so tables and code blocks of different messages do not collide.
+fn render_markdown(ui: &mut egui::Ui, idx: usize, text: &str, cache: &mut CommonMarkCache) {
+    let id = ui.scope_id().with(("assistant_md", idx));
+    CommonMarkViewer::new().show_with_id(id, ui, cache, text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bedrock_form_builds_options_per_auth_mode() {
+        let mut f = SettingsForm {
+            provider: ProviderId::Bedrock,
+            region: " eu-west-1 ".into(),
+            access_key_id: "AKIA1".into(),
+            session_token: "tok".into(),
+            ..Default::default()
+        };
+        let o = f.options();
+        assert_eq!(o.len(), 1, "API key mode sends only the region");
+        assert_eq!(o[llm::OPT_REGION], "eu-west-1");
+        f.aws_access_keys = true;
+        let o = f.options();
+        assert_eq!(o[llm::OPT_AWS_ACCESS_KEY_ID], "AKIA1");
+        assert_eq!(o[llm::OPT_AWS_SESSION_TOKEN], "tok");
+        assert_eq!(
+            f.base_url_hint(),
+            "https://bedrock-mantle.eu-west-1.api.aws/anthropic"
+        );
+        f.provider = ProviderId::OpenAi;
+        assert!(f.options().is_empty());
+    }
+
+    #[test]
+    fn markdown_replies_render_headless() {
+        let reply = "## Orders\n\n| # | Customer | Total |\n|---|---|---|\n| 727 | Ana | **84.50 EUR** |\n\n- one\n- two\n\n```\ncode\n```\n\nPartial *stream";
+        let ctx = egui::Context::default();
+        let mut cache = CommonMarkCache::default();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                render_markdown(ui, 0, reply, &mut cache);
+                render_markdown(ui, 1, reply, &mut cache);
+            });
+            assert!(!out.shapes.is_empty(), "something was drawn");
+            // Headless: there is no renderer to upload font textures to.
+            out.textures_delta.clear();
         }
     }
 }

@@ -2,12 +2,15 @@
 //! provider is normalised into `ChatMessage` in and `StreamEvent` out.
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod fake;
 pub mod google;
 mod http;
 pub mod openai;
+pub mod sigv4;
 pub mod sse;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -151,14 +154,27 @@ pub enum ProviderId {
     Anthropic,
     Google,
     DeepSeek,
+    /// Claude in Amazon Bedrock (the Messages-API `bedrock-mantle` endpoint).
+    Bedrock,
+}
+
+/// Keys of `ProviderConfig::options`.
+pub const OPT_REGION: &str = "region";
+pub const OPT_AWS_ACCESS_KEY_ID: &str = "aws_access_key_id";
+pub const OPT_AWS_SESSION_TOKEN: &str = "aws_session_token";
+
+/// Options whose values are credentials and must be treated like API keys.
+pub fn is_secret_option(key: &str) -> bool {
+    key == OPT_AWS_SESSION_TOKEN
 }
 
 impl ProviderId {
-    pub const ALL: [ProviderId; 4] = [
+    pub const ALL: [ProviderId; 5] = [
         ProviderId::OpenAi,
         ProviderId::Anthropic,
         ProviderId::Google,
         ProviderId::DeepSeek,
+        ProviderId::Bedrock,
     ];
 
     pub fn id(self) -> &'static str {
@@ -167,6 +183,7 @@ impl ProviderId {
             ProviderId::Anthropic => "anthropic",
             ProviderId::Google => "google",
             ProviderId::DeepSeek => "deepseek",
+            ProviderId::Bedrock => "bedrock",
         }
     }
 
@@ -180,6 +197,7 @@ impl ProviderId {
             ProviderId::Anthropic => "Anthropic",
             ProviderId::Google => "Google Gemini",
             ProviderId::DeepSeek => "DeepSeek",
+            ProviderId::Bedrock => "AWS Bedrock",
         }
     }
 
@@ -190,6 +208,7 @@ impl ProviderId {
             ProviderId::Anthropic => "claude-opus-5-5",
             ProviderId::Google => "gemini-2.5-pro",
             ProviderId::DeepSeek => "deepseek-chat",
+            ProviderId::Bedrock => "anthropic.claude-opus-5-5",
         }
     }
 
@@ -199,6 +218,8 @@ impl ProviderId {
             ProviderId::Anthropic => "https://api.anthropic.com",
             ProviderId::Google => "https://generativelanguage.googleapis.com",
             ProviderId::DeepSeek => "https://api.deepseek.com",
+            // `{region}` is filled from the region option.
+            ProviderId::Bedrock => "https://bedrock-mantle.{region}.api.aws/anthropic",
         }
     }
 }
@@ -209,21 +230,33 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub base_url: Option<String>,
     pub model: String,
+    /// Provider-specific settings (see the `OPT_*` keys).
+    pub options: BTreeMap<String, String>,
 }
 
 impl ProviderConfig {
+    pub fn option(&self, key: &str) -> Option<&str> {
+        self.options
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn default_base_url(&self) -> String {
+        let template = self.provider.default_base_url();
+        template.replace("{region}", self.option(OPT_REGION).unwrap_or("us-east-1"))
+    }
+
     /// True when no custom base URL points the client at a proxy or gateway.
     pub fn is_official_endpoint(&self) -> bool {
-        self.base_url().trim_end_matches('/') == self.provider.default_base_url()
+        self.base_url().trim_end_matches('/') == self.default_base_url()
     }
 
     pub fn base_url(&self) -> String {
-        self.base_url
-            .as_deref()
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or(self.provider.default_base_url())
-            .trim_end_matches('/')
-            .to_string()
+        match self.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
+            Some(u) => u.trim_end_matches('/').to_string(),
+            None => self.default_base_url(),
+        }
     }
 }
 
@@ -234,6 +267,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("options", &self.options.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -257,6 +291,7 @@ pub fn build_provider(
             http,
         ))),
         ProviderId::Google => Ok(Arc::new(google::GoogleProvider::new(cfg.clone(), http))),
+        ProviderId::Bedrock => Ok(Arc::new(bedrock::BedrockProvider::new(cfg.clone(), http)?)),
     }
 }
 
@@ -275,6 +310,7 @@ mod tests {
     #[test]
     fn provider_config_debug_redacts_key() {
         let cfg = ProviderConfig {
+            options: Default::default(),
             provider: ProviderId::OpenAi,
             api_key: "sk-secret".into(),
             base_url: None,
@@ -287,6 +323,7 @@ mod tests {
     #[test]
     fn build_provider_requires_key() {
         let cfg = ProviderConfig {
+            options: Default::default(),
             provider: ProviderId::DeepSeek,
             api_key: " ".into(),
             base_url: None,

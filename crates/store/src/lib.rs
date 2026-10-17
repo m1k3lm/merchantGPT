@@ -16,7 +16,10 @@ use rusqlite::Connection;
 pub use key::{DbKey, InMemoryKeyStore, KeyStore, KeyringKeyStore};
 pub use repo::*;
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_llm_options.sql"),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -150,6 +153,7 @@ mod tests {
         let path = dir.path().join("m.db");
         let s = Store::open(&path, &DbKey::generate().unwrap()).unwrap();
         s.save_llm_settings(&LlmSettingsRow {
+            options: Default::default(),
             provider: "openai".into(),
             api_key: "sk-very-secret-value".into(),
             base_url: None,

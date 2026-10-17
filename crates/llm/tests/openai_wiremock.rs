@@ -13,6 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn config(server: &MockServer, provider: ProviderId) -> ProviderConfig {
     ProviderConfig {
+        options: Default::default(),
         provider,
         api_key: "sk-test".into(),
         base_url: Some(format!("{}/v1", server.uri())),
