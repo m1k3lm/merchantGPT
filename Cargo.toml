@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+tools = { path = "crates/tools" }
+connectors = { path = "crates/connectors" }
+llm = { path = "crates/llm" }
+skills = { path = "crates/skills" }
+store = { path = "crates/store" }
+chat-core = { path = "crates/core" }

@@ -1,0 +1,15 @@
+services:
+  dev:
+    build: .
+    working_dir: /app
+    volumes:
+      - .:/app
+      - target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    command: cargo build
+
+volumes:
+  target:
+  cargo-registry:
+  cargo-git:
