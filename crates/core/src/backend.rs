@@ -13,8 +13,13 @@ use skills::{ScriptLimits, Skill};
 use store::Store;
 use tools::{CancellationToken, Tool, ToolContext, ToolRegistry};
 
-use crate::agent::{Agent, AgentConfig, AgentEvent, AuditEntry, AuditSink, AuditStage, UiGate};
+use chrono::NaiveDateTime;
+
+use crate::agent::{
+    Agent, AgentConfig, AgentEvent, AuditEntry, AuditSink, AuditStage, AutoDeny, UiGate,
+};
 use crate::prompt::{system_prompt, PromptContext};
+use crate::scheduler::Schedule;
 
 #[derive(Debug)]
 pub enum Command {
@@ -39,6 +44,29 @@ pub enum Command {
         title: String,
     },
     DeleteConversation(i64),
+    /// Runs every enabled task whose schedule is due now (sent by a timer).
+    RunDueTasks,
+    CreateTask {
+        name: String,
+        prompt: String,
+        schedule: String,
+    },
+    SetTaskEnabled {
+        id: i64,
+        enabled: bool,
+    },
+    DeleteTask(i64),
+    RunTaskNow(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub schedule: String,
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +126,12 @@ pub enum BackendEvent {
     LlmSettings(Vec<LlmSettingSummary>),
     /// Skills available as `/name` commands.
     Skills(Vec<SkillSummary>),
+    /// Scheduled tasks of the active shop.
+    Tasks(Vec<TaskSummary>),
+    TaskFinished {
+        name: String,
+        error: Option<String>,
+    },
     Shops {
         shops: Vec<ShopSummary>,
         active: Option<i64>,
@@ -288,6 +322,42 @@ impl Backend {
                 }
             }
             Command::DeleteConversation(id) => self.delete_conversation(id),
+            Command::RunDueTasks => {
+                self.run_due_tasks_at(chrono::Local::now().naive_local())
+                    .await;
+                Ok(())
+            }
+            Command::CreateTask {
+                name,
+                prompt,
+                schedule,
+            } => self.create_task(&name, &prompt, &schedule),
+            Command::SetTaskEnabled { id, enabled } => self
+                .store
+                .set_task_enabled(id, enabled)
+                .map_err(err)
+                .and_then(|_| self.emit_tasks()),
+            Command::DeleteTask(id) => self
+                .store
+                .delete_task(id)
+                .map_err(err)
+                .and_then(|_| self.emit_tasks()),
+            Command::RunTaskNow(id) => {
+                match self
+                    .store
+                    .list_tasks(None)
+                    .map_err(err)
+                    .map(|tasks| tasks.into_iter().find(|t| t.id == id))
+                {
+                    Ok(Some(task)) => {
+                        self.run_task(task, chrono::Local::now().naive_local())
+                            .await;
+                        Ok(())
+                    }
+                    Ok(None) => Err(format!("task {id} no longer exists")),
+                    Err(e) => Err(e),
+                }
+            }
         };
         if let Err(e) = result {
             self.emit(BackendEvent::Error(e));
@@ -429,27 +499,28 @@ impl Backend {
             }))
     }
 
+    fn build_connector(&self, shop_id: i64, url: &str) -> Res<Option<Arc<dyn Connector>>> {
+        let Some((kind, creds)) = self.shop_kind(shop_id)? else {
+            return Ok(None);
+        };
+        match ConnectorRegistry::build(kind, url, &creds, self.transport.clone()) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                self.emit(BackendEvent::Error(format!(
+                    "Saved credentials for {url} are unusable: {e}"
+                )));
+                Ok(None)
+            }
+        }
+    }
+
     fn select_shop(&mut self, id: i64) -> Res<()> {
         let row = self
             .store
             .shop(id)
             .map_err(err)?
             .ok_or_else(|| format!("shop {id} no longer exists"))?;
-        let connector = match self.shop_kind(id)? {
-            Some((kind, creds)) => {
-                match ConnectorRegistry::build(kind, &row.url, &creds, self.transport.clone()) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        self.emit(BackendEvent::Error(format!(
-                            "Saved credentials for {} are unusable: {e}",
-                            row.url
-                        )));
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        let connector = self.build_connector(id, &row.url)?;
         self.store.touch_shop(id).map_err(err)?;
         self.shop = Some(ActiveShop {
             id,
@@ -459,6 +530,7 @@ impl Backend {
         });
         self.rebuild_tools();
         self.emit_shops()?;
+        self.emit_tasks()?;
         self.open_latest_conversation()
     }
 
@@ -477,20 +549,25 @@ impl Backend {
     }
 
     fn rebuild_tools(&mut self) {
-        let mut tools = ToolRegistry::new();
-        if let Some(c) = self.shop.as_ref().and_then(|s| s.connector.as_ref()) {
-            tools.extend(c.tools());
-        }
-        tools.extend(self.extra_tools());
-        self.tools = tools;
+        let connector = self.shop.as_ref().and_then(|s| s.connector.clone());
+        self.tools = self.tools_for(self.active_shop_id(), connector.as_ref());
     }
 
-    fn extra_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let mut tools = skills::skill_tools(self.skills.clone(), ScriptLimits::default());
-        tools.extend(crate::memory::memory_tools(
-            self.store.clone(),
-            self.active_shop_id(),
+    fn tools_for(
+        &self,
+        shop_id: Option<i64>,
+        connector: Option<&Arc<dyn Connector>>,
+    ) -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        if let Some(c) = connector {
+            tools.extend(c.tools());
+        }
+        tools.extend(skills::skill_tools(
+            self.skills.clone(),
+            ScriptLimits::default(),
         ));
+        let memory: Vec<Arc<dyn Tool>> = crate::memory::memory_tools(self.store.clone(), shop_id);
+        tools.extend(memory);
         tools
     }
 
@@ -609,21 +686,29 @@ impl Backend {
     }
 
     fn prompt_context(&self) -> PromptContext {
-        let notes = self
-            .store
-            .memory_notes(self.active_shop_id())
-            .unwrap_or_default();
+        let shop = self.shop.as_ref();
+        self.prompt_context_for(
+            shop.map(|s| s.id),
+            shop.map(|s| s.url.clone()),
+            shop.and_then(|s| s.name.clone()),
+            shop.and_then(|s| s.connector.as_ref()),
+        )
+    }
+
+    fn prompt_context_for(
+        &self,
+        shop_id: Option<i64>,
+        url: Option<String>,
+        name: Option<String>,
+        connector: Option<&Arc<dyn Connector>>,
+    ) -> PromptContext {
+        let notes = self.store.memory_notes(shop_id).unwrap_or_default();
         let skip = notes.len().saturating_sub(MAX_PROMPT_NOTES);
         PromptContext {
             today: Some(chrono::Local::now().date_naive()),
-            shop_name: self.shop.as_ref().and_then(|s| s.name.clone()),
-            shop_url: self.shop.as_ref().map(|s| s.url.clone()),
-            connectors: self
-                .shop
-                .iter()
-                .filter_map(|s| s.connector.as_ref())
-                .map(|c| c.kind().display_name())
-                .collect(),
+            shop_name: name,
+            shop_url: url,
+            connectors: connector.iter().map(|c| c.kind().display_name()).collect(),
             skills: self
                 .skills
                 .iter()
@@ -709,6 +794,191 @@ impl Backend {
             .map_err(err);
         self.emit_conversations()?;
         persisted?;
+        outcome.map(|_| ()).map_err(err)
+    }
+}
+
+fn to_local(rfc3339: &str) -> Option<NaiveDateTime> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Local).naive_local())
+}
+
+fn local_to_rfc3339(t: NaiveDateTime) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .from_local_datetime(&t)
+        .earliest()
+        .map(|l| l.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|| t.and_utc())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+const UNATTENDED_NOTE: &str = "\n\nThis is a scheduled task running unattended; the merchant is not watching. You cannot change the shop: report what you find and what you would recommend.";
+
+impl Backend {
+    fn emit_tasks(&self) -> Res<()> {
+        let tasks = match self.active_shop_id() {
+            Some(id) => self.store.list_tasks(Some(id)).map_err(err)?,
+            None => Vec::new(),
+        };
+        self.emit(BackendEvent::Tasks(
+            tasks
+                .into_iter()
+                .map(|t| TaskSummary {
+                    id: t.id,
+                    name: t.name,
+                    prompt: t.prompt,
+                    schedule: t.schedule,
+                    enabled: t.enabled,
+                    last_run_at: t.last_run_at,
+                })
+                .collect(),
+        ));
+        Ok(())
+    }
+
+    fn create_task(&mut self, name: &str, prompt: &str, schedule: &str) -> Res<()> {
+        let shop_id = self
+            .active_shop_id()
+            .ok_or("Connect a shop before scheduling tasks.")?;
+        let (name, prompt) = (name.trim(), prompt.trim());
+        if name.is_empty() || prompt.is_empty() {
+            return Err("A task needs a name and a prompt.".into());
+        }
+        let schedule: Schedule = schedule.parse()?;
+        self.store
+            .create_task(&store::NewTask {
+                shop_id,
+                name: name.into(),
+                prompt: prompt.into(),
+                schedule: schedule.to_string(),
+            })
+            .map_err(err)?;
+        self.emit_tasks()
+    }
+
+    /// Runs every enabled task that is due at `now` (local time). A task
+    /// missed while the app was closed runs once.
+    pub async fn run_due_tasks_at(&mut self, now: NaiveDateTime) {
+        if self.llm.is_none() {
+            return;
+        }
+        let tasks = match self.store.list_tasks(None) {
+            Ok(t) => t,
+            Err(e) => return self.emit(BackendEvent::Error(e.to_string())),
+        };
+        for task in tasks.into_iter().filter(|t| t.enabled) {
+            let Ok(schedule) = task.schedule.parse::<Schedule>() else {
+                continue;
+            };
+            let anchor = task
+                .last_run_at
+                .as_deref()
+                .and_then(to_local)
+                .or_else(|| to_local(&task.created_at));
+            if anchor.is_some_and(|a| schedule.is_due(a, now)) {
+                self.run_task(task, now).await;
+            }
+        }
+    }
+
+    async fn run_task(&mut self, task: store::TaskRow, now: NaiveDateTime) {
+        let name = task.name.clone();
+        let error = self.run_task_inner(task, now).await.err();
+        self.emit(BackendEvent::TaskFinished { name, error });
+        let _ = self.emit_tasks();
+        let _ = self.emit_conversations();
+    }
+
+    async fn run_task_inner(&mut self, task: store::TaskRow, now: NaiveDateTime) -> Res<()> {
+        let Some((cfg, provider)) = self.llm.clone() else {
+            return Err("Configure an AI provider in Settings first.".into());
+        };
+        let shop = self
+            .store
+            .shop(task.shop_id)
+            .map_err(err)?
+            .ok_or("the task's shop no longer exists")?;
+        let connector = self.build_connector(shop.id, &shop.url)?;
+        let tools = self.tools_for(Some(shop.id), connector.as_ref());
+        let conversation = match task.conversation_id {
+            Some(id) if self.store.conversation(id).map_err(err)?.is_some() => id,
+            _ => self
+                .store
+                .create_conversation(Some(shop.id), &format!("Task: {}", task.name))
+                .map_err(err)?,
+        };
+        // Recorded before running so a failing task is not retried every minute.
+        self.store
+            .mark_task_run(task.id, &local_to_rfc3339(now), Some(conversation))
+            .map_err(err)?;
+
+        let text = match skills::expand_command(&task.prompt, &self.skills) {
+            Some(expanded) => format!("{}\n\n{expanded}", task.prompt),
+            None => task.prompt.clone(),
+        };
+        let mut history = vec![ChatMessage::user(format!(
+            "[Scheduled task: {}] {text}",
+            task.name
+        ))];
+        let usage = Arc::new(Mutex::new(Usage::default()));
+        let sink: crate::agent::EventSink = {
+            let usage = usage.clone();
+            Arc::new(move |e| {
+                if let AgentEvent::Usage(u) = e {
+                    let mut total = usage.lock().unwrap();
+                    total.input_tokens += u.input_tokens;
+                    total.output_tokens += u.output_tokens;
+                }
+            })
+        };
+        let config = AgentConfig {
+            model: cfg.model.clone(),
+            ..self.agent_defaults.clone()
+        };
+        let audit = StoreAudit {
+            store: self.store.clone(),
+            shop_id: Some(shop.id),
+            conversation_id: Some(conversation),
+        };
+        let ctx = ToolContext {
+            shop_id: Some(shop.id.to_string()),
+            unattended: true,
+            cancel: CancellationToken::new(),
+        };
+        let prompt = format!(
+            "{}{UNATTENDED_NOTE}",
+            system_prompt(&self.prompt_context_for(
+                Some(shop.id),
+                Some(shop.url.clone()),
+                shop.name.clone(),
+                connector.as_ref(),
+            ))
+        );
+        let agent = Agent {
+            provider: provider.as_ref(),
+            tools: &tools,
+            gate: &AutoDeny,
+            audit: &audit,
+            sink,
+            config: &config,
+        };
+        let outcome = agent.run_turn(&prompt, &mut history, &ctx).await;
+        let serialized: Vec<String> = history
+            .iter()
+            .filter_map(|m| serde_json::to_string(m).ok())
+            .collect();
+        self.store
+            .append_messages(conversation, &serialized)
+            .map_err(err)?;
+        let u = *usage.lock().unwrap();
+        self.store
+            .add_usage(conversation, u.input_tokens, u.output_tokens)
+            .map_err(err)?;
+        if self.conversation == Some(conversation) {
+            self.open_conversation(conversation)?;
+        }
         outcome.map(|_| ()).map_err(err)
     }
 }
@@ -1098,6 +1368,118 @@ mod tests {
         };
         assert!(text.starts_with("/daily-sales please"));
         assert!(text.contains("Call shop_sales_report for yesterday."));
+    }
+
+    fn tomorrow_at(hour: u32) -> NaiveDateTime {
+        (chrono::Local::now().date_naive() + chrono::Days::new(1))
+            .and_hms_opt(hour, 0, 0)
+            .unwrap()
+    }
+
+    async fn shop_with_task(f: &mut Fixture, schedule: &str) -> i64 {
+        f.configure().await;
+        f.connect("a.test", Platform::Magento).await;
+        f.backend
+            .handle(Command::CreateTask {
+                name: "Morning".into(),
+                prompt: "Summarise yesterday".into(),
+                schedule: schedule.into(),
+            })
+            .await;
+        f.store.list_tasks(None).unwrap()[0].id
+    }
+
+    #[tokio::test]
+    async fn due_task_runs_once_per_period() {
+        let mut f = fixture();
+        shop_with_task(&mut f, "daily 09:00").await;
+        f.provider.push_text("Sales were fine").push_text("again");
+        f.backend.run_due_tasks_at(tomorrow_at(8)).await;
+        assert!(f.provider.requests().is_empty(), "not due before 09:00");
+        f.backend.run_due_tasks_at(tomorrow_at(9)).await;
+        f.backend.run_due_tasks_at(tomorrow_at(10)).await;
+        assert_eq!(f.provider.requests().len(), 1);
+
+        let task = &f.store.list_tasks(None).unwrap()[0];
+        let conv = task.conversation_id.unwrap();
+        assert_eq!(f.store.messages(conv).unwrap().len(), 2);
+        assert!(f.events().iter().any(
+            |e| matches!(e, BackendEvent::TaskFinished { name, error: None } if name == "Morning")
+        ));
+        let req = &f.provider.requests()[0];
+        assert!(
+            matches!(&req.messages[0], ChatMessage::System { text } if text.contains("unattended"))
+        );
+        assert_eq!(
+            f.backend.conversation_id(),
+            None,
+            "the open chat is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn missed_task_runs_once_on_startup() {
+        let store = Store::open_in_memory().unwrap();
+        let mut first = fixture_with(store.clone());
+        shop_with_task(&mut first, "daily 09:00").await;
+
+        let mut second = fixture_with(store);
+        second.provider.push_text("Caught up").push_text("x");
+        second.backend.handle(Command::Init).await;
+        let three_days_later = tomorrow_at(12) + chrono::Days::new(2);
+        second.backend.run_due_tasks_at(three_days_later).await;
+        second.backend.run_due_tasks_at(three_days_later).await;
+        assert_eq!(second.provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unattended_run_never_executes_mutating_tool() {
+        let mut f = fixture();
+        let id = shop_with_task(&mut f, "every 6h").await;
+        f.provider
+            .push_tool_call(
+                "c",
+                "shop_update_order_status",
+                json!({"id": "1", "status": "completed"}),
+            )
+            .push_text("I would complete order 1");
+        f.backend.handle(Command::RunTaskNow(id)).await;
+        let audit = f.store.audit_log(None, 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].stage, "denied");
+        assert!(
+            !f.events()
+                .iter()
+                .any(|e| matches!(e, BackendEvent::Agent(_))),
+            "unattended runs do not stream into the open chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_schedules_and_shopless_tasks_are_rejected() {
+        let mut f = fixture();
+        f.backend
+            .handle(Command::CreateTask {
+                name: "x".into(),
+                prompt: "y".into(),
+                schedule: "daily 09:00".into(),
+            })
+            .await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("Connect a shop"))
+        );
+        f.connect("a.test", Platform::Magento).await;
+        f.backend
+            .handle(Command::CreateTask {
+                name: "x".into(),
+                prompt: "y".into(),
+                schedule: "sometimes".into(),
+            })
+            .await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("unknown schedule"))
+        );
+        assert!(f.store.list_tasks(None).unwrap().is_empty());
     }
 
     #[test]

@@ -62,6 +62,17 @@ impl Runtime {
             }
         });
         let _ = cmd_tx.send(Command::Init);
+        let tick = cmd_tx.clone();
+        rt.spawn(async move {
+            // The first tick fires at once, catching up on tasks missed while closed.
+            let mut every_minute = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                every_minute.tick().await;
+                if tick.send(Command::RunDueTasks).is_err() {
+                    break;
+                }
+            }
+        });
         Ok(Self {
             _rt: rt,
             commands: cmd_tx,

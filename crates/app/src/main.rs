@@ -60,6 +60,15 @@ enum Dialog {
         id: i64,
         title: String,
     },
+    NewTask {
+        name: String,
+        prompt: String,
+        schedule: String,
+    },
+    DeleteTask {
+        id: i64,
+        name: String,
+    },
 }
 
 struct SettingsForm {
@@ -275,6 +284,51 @@ impl App {
                         }
                     });
                 });
+                if self.state.active_shop.is_some() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.strong("Tasks");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("New").clicked() {
+                                self.dialog = Dialog::NewTask {
+                                    name: String::new(),
+                                    prompt: String::new(),
+                                    schedule: "daily 09:00".into(),
+                                };
+                            }
+                        });
+                    });
+                    for t in &self.state.tasks {
+                        ui.horizontal(|ui| {
+                            let mut enabled = t.enabled;
+                            if ui.checkbox(&mut enabled, "").changed() {
+                                cmds.push(Command::SetTaskEnabled { id: t.id, enabled });
+                            }
+                            let last = t.last_run_at.as_deref().unwrap_or("never");
+                            let resp = ui.label(&t.name).on_hover_text(format!(
+                                "{}\nLast run: {last}\n\n{}",
+                                t.schedule, t.prompt
+                            ));
+                            resp.context_menu(|ui| {
+                                if ui
+                                    .add_enabled(!self.state.busy, egui::Button::new("Run now"))
+                                    .clicked()
+                                {
+                                    cmds.push(Command::RunTaskNow(t.id));
+                                    ui.close();
+                                }
+                                if ui.button("Delete…").clicked() {
+                                    self.dialog = Dialog::DeleteTask {
+                                        id: t.id,
+                                        name: t.name.clone(),
+                                    };
+                                    ui.close();
+                                }
+                            });
+                        });
+                    }
+                    ui.separator();
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for c in &self.state.conversations {
                         let active = Some(c.id) == self.state.active_conversation;
@@ -575,6 +629,65 @@ impl App {
                             }
                         });
                     });
+            }
+            Dialog::NewTask {
+                name,
+                prompt,
+                schedule,
+            } => {
+                egui::Window::new("New scheduled task")
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        if ui.small_button("Use preset: daily sales summary").clicked() {
+                            *name = "Daily sales summary".into();
+                            *prompt = "/daily-sales-summary".into();
+                            *schedule = "daily 09:00".into();
+                        }
+                        ui.label("Name");
+                        ui.text_edit_singleline(name);
+                        ui.label("What should the assistant do? (a /skill works too)");
+                        ui.add(egui::TextEdit::multiline(prompt).desired_rows(3));
+                        ui.label("Schedule");
+                        ui.add(
+                            egui::TextEdit::singleline(schedule)
+                                .hint_text("daily 09:00 · weekly mon 08:30 · every 6h"),
+                        );
+                        let parsed = schedule.parse::<chat_core::scheduler::Schedule>();
+                        if let Err(e) = &parsed {
+                            ui.colored_label(RED, e);
+                        }
+                        ui.weak("Scheduled runs can read your shop but never change it.");
+                        ui.horizontal(|ui| {
+                            let ready = parsed.is_ok()
+                                && !name.trim().is_empty()
+                                && !prompt.trim().is_empty();
+                            if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
+                                cmd = Some(Command::CreateTask {
+                                    name: name.clone(),
+                                    prompt: prompt.clone(),
+                                    schedule: schedule.clone(),
+                                });
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            }
+            Dialog::DeleteTask { id, name } => {
+                egui::Window::new("Delete task").resizable(false).show(ctx, |ui| {
+                    ui.label(format!("Delete the scheduled task \"{name}\"? Its past reports stay in their chat."));
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Delete").color(RED)).clicked() {
+                            cmd = Some(Command::DeleteTask(*id));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
             }
             Dialog::DeleteConversation { id, title } => {
                 egui::Window::new("Delete chat")

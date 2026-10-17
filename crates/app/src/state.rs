@@ -3,7 +3,7 @@
 
 use chat_core::{
     AgentEvent, BackendEvent, Command, ConversationSummary, Decision, LlmSettingSummary, Responder,
-    ShopSummary, SkillSummary,
+    ShopSummary, SkillSummary, TaskSummary,
 };
 use llm::{ChatMessage, ProviderId, Usage};
 use tools::{CancellationToken, Mutability, ToolCall};
@@ -57,6 +57,7 @@ pub struct AppState {
     pub conversations: Vec<ConversationSummary>,
     pub active_conversation: Option<i64>,
     pub skills: Vec<SkillSummary>,
+    pub tasks: Vec<TaskSummary>,
 }
 
 pub fn pretty_args(v: &serde_json::Value) -> String {
@@ -215,6 +216,13 @@ impl AppState {
             BackendEvent::LlmConfigured { provider, model } => self.llm = Some((provider, model)),
             BackendEvent::LlmSettings(s) => self.llm_settings = s,
             BackendEvent::Skills(s) => self.skills = s,
+            BackendEvent::Tasks(t) => self.tasks = t,
+            BackendEvent::TaskFinished { name, error } => self.items.push(match error {
+                None => ChatItem::Notice(format!(
+                    "Scheduled task \"{name}\" finished; its report is in the \"Task: {name}\" chat."
+                )),
+                Some(e) => ChatItem::Error(format!("Scheduled task \"{name}\" failed: {e}")),
+            }),
             BackendEvent::Shops { shops, active } => {
                 self.shops = shops;
                 self.active_shop = active;

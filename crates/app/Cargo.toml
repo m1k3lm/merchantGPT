@@ -16,6 +16,6 @@ tools.workspace = true
 store.workspace = true
 skills.workspace = true
 eframe = "0.37.0"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "macros", "time"] }
 reqwest = "0.13.5"
 serde_json = "1.0.154"
