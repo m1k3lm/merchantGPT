@@ -958,53 +958,64 @@ fn google_ads_window(
             );
             ui.add_space(6.0);
 
-            egui::CollapsingHeader::new("App credentials (one-time setup)")
-                .id_salt("google_app_setup")
-                .open(Some(form.show_setup))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new("Whoever distributes merchantGPT creates these once: a Google Cloud OAuth client of type \"Desktop app\" with the Google Ads API enabled, and a developer token from the API Center of a Google Ads manager account.")
-                                .weak()
-                                .small(),
-                        )
-                        .wrap(),
-                    );
-                    let saved = |configured: bool| if configured { "saved; leave blank to keep" } else { "" };
-                    egui::Grid::new("google_app").num_columns(2).show(ui, |ui| {
-                        ui.label("OAuth client ID");
-                        ui.text_edit_singleline(&mut form.client_id);
-                        ui.end_row();
-                        ui.label("OAuth client secret");
+            // Built-in credentials (the normal release) need no setup at all.
+            let built_in = state.google_built_in;
+            if !built_in.all() {
+                egui::CollapsingHeader::new("App credentials (one-time setup)")
+                    .id_salt("google_app_setup")
+                    .open(Some(form.show_setup))
+                    .show(ui, |ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut form.client_secret)
-                                .password(true)
-                                .hint_text(saved(state.google_app_configured)),
+                            egui::Label::new(
+                                RichText::new("This build of merchantGPT does not include all of its Google credentials. Whoever distributes it can provide them: a Google Cloud OAuth client of type \"Desktop app\" with the Google Ads API enabled, and a developer token from the API Center of a Google Ads manager account.")
+                                    .weak()
+                                    .small(),
+                            )
+                            .wrap(),
                         );
-                        ui.end_row();
-                        ui.label("Developer token");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.developer_token)
-                                .password(true)
-                                .hint_text(saved(state.google_app_configured)),
-                        );
-                        ui.end_row();
-                    });
-                    let ready = !form.client_id.trim().is_empty()
-                        && (state.google_app_configured
-                            || (!form.client_secret.trim().is_empty()
-                                && !form.developer_token.trim().is_empty()));
-                    if ui.add_enabled(ready, egui::Button::new("Save")).clicked() {
-                        cmd = Some(Command::SaveGoogleAdsApp {
-                            client_id: form.client_id.clone(),
-                            client_secret: std::mem::take(&mut form.client_secret),
-                            developer_token: std::mem::take(&mut form.developer_token),
+                        let hint = |configured: bool| if configured { "saved; leave blank to keep" } else { "" };
+                        egui::Grid::new("google_app").num_columns(2).show(ui, |ui| {
+                            if !built_in.client_id {
+                                ui.label("OAuth client ID");
+                                ui.text_edit_singleline(&mut form.client_id);
+                                ui.end_row();
+                            }
+                            if !built_in.client_secret {
+                                ui.label("OAuth client secret");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.client_secret)
+                                        .password(true)
+                                        .hint_text(hint(state.google_app_configured)),
+                                );
+                                ui.end_row();
+                            }
+                            if !built_in.developer_token {
+                                ui.label("Developer token");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.developer_token)
+                                        .password(true)
+                                        .hint_text(hint(state.google_app_configured)),
+                                );
+                                ui.end_row();
+                            }
                         });
-                        form.show_setup = false;
-                    }
-                });
-            if !form.show_setup && ui.small_button("Edit app credentials").clicked() {
-                form.show_setup = true;
+                        let filled = |built: bool, value: &str| built || !value.trim().is_empty();
+                        let ready = state.google_app_configured
+                            || (filled(built_in.client_id, &form.client_id)
+                                && filled(built_in.client_secret, &form.client_secret)
+                                && filled(built_in.developer_token, &form.developer_token));
+                        if ui.add_enabled(ready, egui::Button::new("Save")).clicked() {
+                            cmd = Some(Command::SaveGoogleAdsApp {
+                                client_id: form.client_id.clone(),
+                                client_secret: std::mem::take(&mut form.client_secret),
+                                developer_token: std::mem::take(&mut form.developer_token),
+                            });
+                            form.show_setup = false;
+                        }
+                    });
+                if !form.show_setup && ui.small_button("Edit app credentials").clicked() {
+                    form.show_setup = true;
+                }
             }
             ui.separator();
 
@@ -1213,6 +1224,43 @@ mod tests {
             out.textures_delta.clear();
         }
         result
+    }
+
+    #[test]
+    fn built_in_credentials_hide_the_setup_section() {
+        let state = AppState {
+            google_app_configured: true,
+            google_built_in: chat_core::GoogleBuiltIn {
+                client_id: true,
+                client_secret: true,
+                developer_token: true,
+            },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut form = GoogleAdsForm::default();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                google_ads_window(ui.ctx(), &mut form, &state);
+            });
+            out.textures_delta.clear();
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+        }
+        assert!(
+            texts.iter().any(|t| t == "Sign in with Google"),
+            "{texts:?}"
+        );
+        assert!(!texts
+            .iter()
+            .any(|t| t.contains("App credentials") || t.contains("Developer token")));
     }
 
     #[test]

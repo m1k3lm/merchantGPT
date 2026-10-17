@@ -61,6 +61,8 @@ pub struct AppState {
     pub audit: Vec<AuditSummary>,
     pub google_app_configured: bool,
     pub google_app_client_id: String,
+    /// App credentials compiled into this build; the UI never asks for them.
+    pub google_built_in: chat_core::GoogleBuiltIn,
     pub google_sign_in: GoogleSignInState,
 }
 
@@ -225,9 +227,11 @@ impl AppState {
             BackendEvent::GoogleAdsApp {
                 configured,
                 client_id,
+                built_in,
             } => {
                 self.google_app_configured = configured;
                 self.google_app_client_id = client_id;
+                self.google_built_in = built_in;
             }
             BackendEvent::GoogleSignIn(s) => self.google_sign_in = s,
             BackendEvent::TaskFinished { name, error } => self.items.push(match error {
@@ -422,7 +426,12 @@ mod tests {
         s.apply(BackendEvent::GoogleAdsApp {
             configured: true,
             client_id: "cid".into(),
+            built_in: chat_core::GoogleBuiltIn {
+                developer_token: true,
+                ..Default::default()
+            },
         });
+        assert!(s.google_built_in.developer_token);
         s.apply(BackendEvent::GoogleSignIn(GoogleSignInState::Waiting));
         assert!(s.google_app_configured);
         assert_eq!(s.google_app_client_id, "cid");

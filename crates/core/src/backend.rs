@@ -174,6 +174,8 @@ pub enum BackendEvent {
     GoogleAdsApp {
         configured: bool,
         client_id: String,
+        /// Which app credentials ship inside this build; the UI never asks for those.
+        built_in: GoogleBuiltIn,
     },
     GoogleSignIn(GoogleSignInState),
     Shops {
@@ -222,21 +224,62 @@ pub struct Backend {
     open_browser: Arc<dyn Fn(&str) + Send + Sync>,
     google_sign_in: Option<CancellationToken>,
     google_pending: Option<GooglePending>,
+    google_built_in: GoogleApp,
 }
 
 /// A finished Google sign-in waiting for the merchant to pick an account.
 struct GooglePending {
-    app: GoogleApp,
     refresh_token: String,
     accounts: Vec<AdsAccount>,
 }
 
-/// The app's Google OAuth client and developer token, set up once.
+/// The app's Google OAuth client and developer token. They normally ship in
+/// the build (see `GoogleApp::built_in`); anything missing is set up once in
+/// the app and stored encrypted.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-struct GoogleApp {
-    client_id: String,
-    client_secret: String,
-    developer_token: String,
+pub struct GoogleApp {
+    pub client_id: String,
+    pub client_secret: String,
+    pub developer_token: String,
+}
+
+impl GoogleApp {
+    /// Values compiled in by the publisher's release build
+    /// (`scripts/build-release.sh`); empty when the variable was not set.
+    pub fn built_in() -> Self {
+        Self {
+            client_id: option_env!("MERCHANTGPT_GOOGLE_OAUTH_CLIENT_ID")
+                .unwrap_or("")
+                .into(),
+            client_secret: option_env!("MERCHANTGPT_GOOGLE_OAUTH_CLIENT_SECRET")
+                .unwrap_or("")
+                .into(),
+            developer_token: option_env!("MERCHANTGPT_GOOGLE_ADS_DEVELOPER_TOKEN")
+                .unwrap_or("")
+                .into(),
+        }
+    }
+
+    fn status(&self) -> GoogleBuiltIn {
+        GoogleBuiltIn {
+            client_id: !self.client_id.trim().is_empty(),
+            client_secret: !self.client_secret.trim().is_empty(),
+            developer_token: !self.developer_token.trim().is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoogleBuiltIn {
+    pub client_id: bool,
+    pub client_secret: bool,
+    pub developer_token: bool,
+}
+
+impl GoogleBuiltIn {
+    pub fn all(self) -> bool {
+        self.client_id && self.client_secret && self.developer_token
+    }
 }
 
 const GOOGLE_APP_KEY: &str = "google_ads_app";
@@ -337,6 +380,7 @@ impl Backend {
             open_browser: Arc::new(|_| {}),
             google_sign_in: None,
             google_pending: None,
+            google_built_in: GoogleApp::built_in(),
         };
         backend.rebuild_tools();
         backend
@@ -707,7 +751,20 @@ impl Backend {
             let Some(kind) = ConnectorKind::parse(&row.kind) else {
                 continue;
             };
-            match ConnectorRegistry::build(kind, url, &row.credentials, self.transport.clone()) {
+            let creds = if kind == ConnectorKind::GoogleAds {
+                match self.with_google_app(row.credentials) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.emit(BackendEvent::Error(format!(
+                            "Google Ads is unavailable: {e}"
+                        )));
+                        continue;
+                    }
+                }
+            } else {
+                row.credentials
+            };
+            match ConnectorRegistry::build(kind, url, &creds, self.transport.clone()) {
                 Ok(c) => out.push(c),
                 Err(e) => self.emit(BackendEvent::Error(format!(
                     "Saved {} credentials for {url} are unusable: {e}",
@@ -1218,12 +1275,36 @@ impl Backend {
 }
 
 impl Backend {
-    fn google_app(&self) -> Res<Option<GoogleApp>> {
-        self.store
+    fn saved_google_app(&self) -> Res<GoogleApp> {
+        Ok(self
+            .store
             .app_setting(GOOGLE_APP_KEY)
             .map_err(err)?
             .map(|json| serde_json::from_str(&json).map_err(err))
-            .transpose()
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Built-in values win; the saved setup fills whatever the build lacks.
+    fn merged_google_app(&self, saved: GoogleApp) -> GoogleApp {
+        let pick = |built: &str, saved: String| {
+            if built.trim().is_empty() {
+                saved
+            } else {
+                built.trim().to_string()
+            }
+        };
+        let b = &self.google_built_in;
+        GoogleApp {
+            client_id: pick(&b.client_id, saved.client_id),
+            client_secret: pick(&b.client_secret, saved.client_secret),
+            developer_token: pick(&b.developer_token, saved.developer_token),
+        }
+    }
+
+    fn google_app(&self) -> Res<Option<GoogleApp>> {
+        let app = self.merged_google_app(self.saved_google_app()?);
+        Ok(app.status().all().then_some(app))
     }
 
     fn emit_google_app(&self) -> Res<()> {
@@ -1231,8 +1312,22 @@ impl Backend {
         self.emit(BackendEvent::GoogleAdsApp {
             configured: app.is_some(),
             client_id: app.map(|a| a.client_id).unwrap_or_default(),
+            built_in: self.google_built_in.status(),
         });
         Ok(())
+    }
+
+    /// Adds the app credentials to a shop's saved Google Ads credentials, so a
+    /// new token in a new release applies without re-linking.
+    fn with_google_app(&self, mut creds: Credentials) -> Res<Credentials> {
+        use connectors::google_ads as g;
+        let app = self
+            .google_app()?
+            .ok_or("the Google Ads app credentials are not set up")?;
+        creds.insert(g::CLIENT_ID.into(), app.client_id);
+        creds.insert(g::CLIENT_SECRET.into(), app.client_secret);
+        creds.insert(g::DEVELOPER_TOKEN.into(), app.developer_token);
+        Ok(creds)
     }
 
     fn save_google_app(
@@ -1241,7 +1336,7 @@ impl Backend {
         client_secret: &str,
         developer_token: &str,
     ) -> Res<()> {
-        let saved = self.google_app()?.unwrap_or_default();
+        let saved = self.saved_google_app()?;
         let keep = |new: &str, old: String| {
             if new.trim().is_empty() {
                 old
@@ -1249,19 +1344,30 @@ impl Backend {
                 new.trim().to_string()
             }
         };
-        let app = GoogleApp {
+        let to_save = GoogleApp {
             client_id: keep(client_id, saved.client_id),
             client_secret: keep(client_secret, saved.client_secret),
             developer_token: keep(developer_token, saved.developer_token),
         };
-        if app.client_id.is_empty()
-            || app.client_secret.is_empty()
-            || app.developer_token.is_empty()
-        {
-            return Err("Enter the OAuth client ID, client secret and developer token.".into());
+        let missing = self.merged_google_app(to_save.clone()).status();
+        if !missing.all() {
+            let mut need = Vec::new();
+            if !missing.client_id {
+                need.push("the OAuth client ID");
+            }
+            if !missing.client_secret {
+                need.push("the OAuth client secret");
+            }
+            if !missing.developer_token {
+                need.push("the developer token");
+            }
+            return Err(format!("Enter {}.", need.join(", ")));
         }
         self.store
-            .set_app_setting(GOOGLE_APP_KEY, &serde_json::to_string(&app).map_err(err)?)
+            .set_app_setting(
+                GOOGLE_APP_KEY,
+                &serde_json::to_string(&to_save).map_err(err)?,
+            )
             .map_err(err)?;
         self.emit_google_app()
     }
@@ -1346,7 +1452,6 @@ impl Backend {
             return Err("This Google user has no Google Ads accounts.".into());
         }
         self.google_pending = Some(GooglePending {
-            app,
             refresh_token,
             accounts: accounts.clone(),
         });
@@ -1375,16 +1480,8 @@ impl Backend {
                 "Manager accounts cannot hold campaigns; pick one of its client accounts.".into(),
             );
         }
+        // App credentials are added at build time, never stored per shop.
         let mut creds = Credentials::from([
-            (g::CLIENT_ID.to_string(), pending.app.client_id.clone()),
-            (
-                g::CLIENT_SECRET.to_string(),
-                pending.app.client_secret.clone(),
-            ),
-            (
-                g::DEVELOPER_TOKEN.to_string(),
-                pending.app.developer_token.clone(),
-            ),
             (g::REFRESH_TOKEN.to_string(), pending.refresh_token.clone()),
             (g::CUSTOMER_ID.to_string(), id.clone()),
         ]);
@@ -1395,7 +1492,7 @@ impl Backend {
         let connector = ConnectorRegistry::build(
             ConnectorKind::GoogleAds,
             &shop.1,
-            &creds,
+            &self.with_google_app(creds.clone())?,
             self.transport.clone(),
         )
         .map_err(err)?;
@@ -1469,7 +1566,7 @@ mod tests {
         let ev = events.clone();
         let p = provider.clone();
         let transport = Arc::new(FakeTransport::new());
-        let backend = Backend::new(
+        let mut backend = Backend::new(
             Arc::new(move |e| {
                 if let BackendEvent::Agent(AgentEvent::ConfirmationRequested {
                     responder, ..
@@ -1483,6 +1580,8 @@ mod tests {
             transport.clone(),
             store.clone(),
         );
+        // Independent of credentials compiled in through release.env.
+        backend.google_built_in = GoogleApp::default();
         Fixture {
             backend,
             events,
@@ -2158,6 +2257,11 @@ mod tests {
         let ads = saved.iter().find(|r| r.kind == "ads:google").unwrap();
         assert_eq!(ads.credentials["refresh_token"], "1//refresh-secret");
         assert_eq!(ads.credentials["customer_id"], "1234567890");
+        assert!(
+            !ads.credentials.contains_key("developer_token")
+                && !ads.credentials.contains_key("client_secret"),
+            "app credentials are not copied into each shop"
+        );
         assert!(f.events().iter().any(|e| matches!(
             e,
             BackendEvent::Shops { shops, .. } if shops[0].connectors.contains(&ConnectorKind::GoogleAds)
@@ -2176,6 +2280,115 @@ mod tests {
             .await;
         assert!(f.backend.tools().get("ads_draft_search_campaign").is_none());
         assert_eq!(f.store.credentials(shop).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn built_in_app_credentials_skip_the_setup_and_reach_the_connector() {
+        let mut f = fixture();
+        google_routes(&f.transport);
+        f.backend.google_built_in = GoogleApp {
+            client_id: "shipped-client".into(),
+            client_secret: "shipped-secret".into(),
+            developer_token: "shipped-devtoken".into(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        f.backend.commands = Some(tx);
+        f.backend.open_browser = approving_browser();
+        f.backend.handle(Command::Init).await;
+        assert!(f.events().iter().any(|e| matches!(
+            e,
+            BackendEvent::GoogleAdsApp { configured: true, built_in, .. } if built_in.all()
+        )));
+
+        f.connect("a.test", Platform::Shopify).await;
+        f.backend.handle(Command::GoogleSignIn).await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::GoogleSignIn(GoogleSignInState::Waiting))
+        ));
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        f.backend.handle(finished).await;
+        f.backend
+            .handle(Command::ConnectGoogleAds {
+                customer_id: "1234567890".into(),
+            })
+            .await;
+        assert!(f.backend.tools().get("ads_list_campaigns").is_some());
+        let api_call = f
+            .transport
+            .requests()
+            .into_iter()
+            .rfind(|r| r.path().contains("googleAds:search"))
+            .unwrap();
+        assert_eq!(
+            api_call.header_value("developer-token"),
+            Some("shipped-devtoken")
+        );
+        let token_call = f
+            .transport
+            .requests()
+            .into_iter()
+            .find(|r| r.path() == "/token")
+            .unwrap();
+        assert!(token_call
+            .body
+            .unwrap()
+            .contains("client_id=shipped-client"));
+
+        f.backend
+            .emit(BackendEvent::Error("x shipped-devtoken".into()));
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e == "x [redacted]"),
+            "built-in secrets are redacted too"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_built_in_only_asks_for_the_missing_values() {
+        let mut f = fixture();
+        f.backend.google_built_in = GoogleApp {
+            developer_token: "shipped-devtoken".into(),
+            ..Default::default()
+        };
+        f.backend.handle(Command::Init).await;
+        assert!(f.events().iter().any(|e| matches!(
+            e,
+            BackendEvent::GoogleAdsApp { configured: false, built_in, .. }
+                if built_in.developer_token && !built_in.client_id
+        )));
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid".into(),
+                client_secret: "".into(),
+                developer_token: "".into(),
+            })
+            .await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::Error(e)) if e == "Enter the OAuth client secret."
+        ));
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid".into(),
+                client_secret: "sec".into(),
+                developer_token: "".into(),
+            })
+            .await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::GoogleAdsApp {
+                configured: true,
+                ..
+            })
+        ));
+        let stored = f.store.app_setting(GOOGLE_APP_KEY).unwrap().unwrap();
+        assert!(
+            !stored.contains("shipped-devtoken"),
+            "built-in values are not stored"
+        );
     }
 
     #[tokio::test]
@@ -2205,7 +2418,7 @@ mod tests {
             .await;
         assert!(matches!(
             f.events().last(),
-            Some(BackendEvent::GoogleAdsApp { configured: true, client_id }) if client_id == "cid2"
+            Some(BackendEvent::GoogleAdsApp { configured: true, client_id, .. }) if client_id == "cid2"
         ));
         let app: serde_json::Value =
             serde_json::from_str(&f.store.app_setting(GOOGLE_APP_KEY).unwrap().unwrap()).unwrap();

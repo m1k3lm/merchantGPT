@@ -11,8 +11,8 @@ pub mod scheduler;
 
 pub use agent::{AgentConfig, AgentEvent, Decision, Responder};
 pub use backend::{
-    AuditSummary, Backend, BackendEvent, Command, ConversationSummary, GoogleSignInState,
-    LlmSettingSummary, ShopSummary, SkillSummary, TaskSummary,
+    AuditSummary, Backend, BackendEvent, Command, ConversationSummary, GoogleBuiltIn,
+    GoogleSignInState, LlmSettingSummary, ShopSummary, SkillSummary, TaskSummary,
 };
 pub use config::Config;
 pub use connectors::Credentials;

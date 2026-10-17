@@ -62,6 +62,22 @@ docker compose build
 docker compose run --rm dev cargo build --release
 ```
 
+### Release builds with Google Ads credentials
+
+The publisher's Google credentials are compiled into the release binary, so they never live in the repository:
+
+- An **OAuth client** (client ID and secret) of type "Desktop app" in a Google Cloud project with the Google Ads API enabled.
+- A **developer token** from the API Center of the publisher's Google Ads manager account. Until Google approves it for Basic access, it only works with test accounts.
+
+```bash
+cp release.env.example release.env      # gitignored; fill in the three values
+bash scripts/build-release.sh           # cargo build --release with them compiled in
+```
+
+The script also reads the values from the environment, which suits CI secrets. It warns about any value that is missing; that build then asks users for it.
+
+Anything compiled into a desktop app can be extracted from the binary. The developer token alone gives no access to anyone's ads account (each call also needs the merchant's own Google sign-in), but it could be misused under the publisher's API quota. A server-side proxy that adds the token would avoid shipping it.
+
 ## Running and first steps
 
 1. Start the app. On first launch it creates its configuration and an encrypted database, and stores the database key in the OS keychain. On macOS, choose "Always Allow" if asked for keychain access (this can happen again after each rebuild).
@@ -78,10 +94,7 @@ docker compose run --rm dev cargo build --release
 
 Click **+**, then **Google Ads** (a shop must be selected; the ads account is linked to it), then **Sign in with Google**. Your browser opens Google's consent page; after you allow access, pick the Google Ads account to link. Client accounts under a manager account are listed too.
 
-The first time, the window asks for the app credentials, which whoever distributes merchantGPT creates once and which are then stored encrypted:
-
-- An **OAuth client** (client ID and secret) of type "Desktop app" in a Google Cloud project with the Google Ads API enabled.
-- A **developer token** from the API Center of a Google Ads manager account. Until Google approves it for Basic access, it only works with test accounts.
+Merchants never enter Google credentials other than their own sign-in: the app's credentials ship inside the release build (see [Release builds with Google Ads credentials](#release-builds-with-google-ads-credentials)). A build made without them asks for the missing ones once and stores them encrypted.
 
 To unlink, right-click the shop and choose **Unlink Google Ads**.
 
