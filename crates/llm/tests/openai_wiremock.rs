@@ -25,6 +25,7 @@ fn request() -> ChatRequest {
         model: "test-model".into(),
         messages: vec![ChatMessage::user("orders in processing?")],
         tools: vec![],
+        tool_choice: Default::default(),
         max_tokens: 256,
         temperature: None,
     }

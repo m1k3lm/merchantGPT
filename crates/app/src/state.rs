@@ -86,7 +86,9 @@ pub fn items_from_history(messages: &[ChatMessage]) -> Vec<ChatItem> {
         match m {
             ChatMessage::System { .. } => {}
             ChatMessage::User { text } => items.push(ChatItem::User(text.clone())),
-            ChatMessage::Assistant { text, tool_calls } => {
+            ChatMessage::Assistant {
+                text, tool_calls, ..
+            } => {
                 if !text.is_empty() {
                     items.push(ChatItem::Assistant(text.clone()));
                 }
@@ -377,10 +379,7 @@ mod tests {
             id: Some(3),
             messages: vec![
                 ChatMessage::user("orders?"),
-                ChatMessage::Assistant {
-                    text: "Checking".into(),
-                    tool_calls: vec![call("a", "shop_list_orders")],
-                },
+                ChatMessage::assistant_with_calls("Checking", vec![call("a", "shop_list_orders")]),
                 ChatMessage::ToolResults {
                     results: vec![ToolResult::error("a", "nope")],
                 },

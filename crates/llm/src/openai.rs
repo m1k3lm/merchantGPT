@@ -10,7 +10,7 @@ use crate::http::send_with_retry;
 use crate::sse::{decode_stream, sse_events, SseDecoder, SseEvent};
 use crate::{
     ChatMessage, ChatRequest, EventStream, LlmError, LlmProvider, ProviderConfig, ProviderId,
-    StopReason, StreamEvent, ToolCall, Usage,
+    StopReason, StreamEvent, ToolCall, ToolChoice, Usage,
 };
 
 pub struct OpenAiProvider {
@@ -53,7 +53,9 @@ pub(crate) fn encode(req: &ChatRequest, provider: ProviderId) -> Value {
                 messages.push(json!({"role": "system", "content": text}))
             }
             ChatMessage::User { text } => messages.push(json!({"role": "user", "content": text})),
-            ChatMessage::Assistant { text, tool_calls } => {
+            ChatMessage::Assistant {
+                text, tool_calls, ..
+            } => {
                 let mut msg = json!({
                     "role": "assistant",
                     "content": if text.is_empty() { Value::Null } else { json!(text) },
@@ -87,16 +89,17 @@ pub(crate) fn encode(req: &ChatRequest, provider: ProviderId) -> Value {
         }
     }
     // OpenAI deprecated max_tokens for newer models; DeepSeek only knows max_tokens.
-    let max_key = match provider {
-        ProviderId::DeepSeek => "max_tokens",
-        _ => "max_completion_tokens",
+    let (max_key, max_tokens) = match provider {
+        // deepseek-chat rejects max_tokens above 8192.
+        ProviderId::DeepSeek => ("max_tokens", req.max_tokens.min(8192)),
+        _ => ("max_completion_tokens", req.max_tokens),
     };
     let mut body = json!({
         "model": req.model,
         "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
-        max_key: req.max_tokens,
+        max_key: max_tokens,
     });
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
@@ -112,6 +115,9 @@ pub(crate) fn encode(req: &ChatRequest, provider: ProviderId) -> Value {
                 })
             })
             .collect();
+        if req.tool_choice == ToolChoice::None {
+            body["tool_choice"] = json!("none");
+        }
     }
     body
 }
@@ -325,6 +331,7 @@ mod tests {
                 parameters: json!({"type": "object"}),
                 mutability: Mutability::Read,
             }],
+            tool_choice: ToolChoice::Auto,
             max_tokens: 100,
             temperature: None,
         }
@@ -335,9 +342,9 @@ mod tests {
         let req = request(vec![
             ChatMessage::system("sys"),
             ChatMessage::user("hi"),
-            ChatMessage::Assistant {
-                text: String::new(),
-                tool_calls: vec![
+            ChatMessage::assistant_with_calls(
+                String::new(),
+                vec![
                     ToolCall {
                         id: "a".into(),
                         name: "shop_get_order".into(),
@@ -349,7 +356,7 @@ mod tests {
                         arguments: json!({"id": "2"}),
                     },
                 ],
-            },
+            ),
             ChatMessage::ToolResults {
                 results: vec![ToolResult::ok("a", "{}"), ToolResult::error("b", "boom")],
             },
@@ -375,11 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_uses_max_tokens_and_tools_are_omitted_when_empty() {
+    fn deepseek_uses_capped_max_tokens_and_tools_are_omitted_when_empty() {
         let mut req = request(vec![ChatMessage::user("hi")]);
         req.tools.clear();
+        req.max_tokens = 16000;
         let body = encode(&req, ProviderId::DeepSeek);
-        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["max_tokens"], 8192);
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_choice_none_keeps_tools_declared() {
+        let mut req = request(vec![ChatMessage::user("hi")]);
+        req.tool_choice = ToolChoice::None;
+        let body = encode(&req, ProviderId::OpenAi);
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
     }
 }

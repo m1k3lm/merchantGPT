@@ -1,7 +1,9 @@
 //! LLM provider abstraction: streaming chat with native tool calling. Every
 //! provider is normalised into `ChatMessage` in and `StreamEvent` out.
 
+pub mod anthropic;
 pub mod fake;
+pub mod google;
 mod http;
 pub mod openai;
 pub mod sse;
@@ -26,6 +28,11 @@ pub enum ChatMessage {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        /// The provider's own content blocks for this turn (Anthropic thinking
+        /// blocks, Gemini thought signatures). They must be replayed unchanged
+        /// to the same provider; other providers rebuild from text and calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_content: Option<ProviderContent>,
     },
     /// All results answering one assistant turn. Kept together because
     /// Anthropic requires them in a single user message.
@@ -47,8 +54,23 @@ impl ChatMessage {
         Self::Assistant {
             text: text.into(),
             tool_calls: Vec::new(),
+            provider_content: None,
         }
     }
+
+    pub fn assistant_with_calls(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self::Assistant {
+            text: text.into(),
+            tool_calls,
+            provider_content: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContent {
+    pub provider: ProviderId,
+    pub content: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -62,6 +84,8 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// A safety system declined; any partial output must not be trusted.
+    Refusal,
     Other(String),
 }
 
@@ -73,7 +97,17 @@ pub enum StreamEvent {
     /// with the raw text, so the agent can report the error back to the model.
     ToolCall(ToolCall),
     Usage(Usage),
+    /// The turn's raw content blocks, emitted just before `Done`.
+    ProviderContent(serde_json::Value),
     Done(StopReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    /// Tools stay declared (history may reference them) but must not be called.
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +115,7 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
 }
@@ -152,7 +187,7 @@ impl ProviderId {
     pub fn suggested_model(self) -> &'static str {
         match self {
             ProviderId::OpenAi => "gpt-5",
-            ProviderId::Anthropic => "claude-sonnet-5-5",
+            ProviderId::Anthropic => "claude-opus-5-5",
             ProviderId::Google => "gemini-2.5-pro",
             ProviderId::DeepSeek => "deepseek-chat",
         }
@@ -177,6 +212,11 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// True when no custom base URL points the client at a proxy or gateway.
+    pub fn is_official_endpoint(&self) -> bool {
+        self.base_url().trim_end_matches('/') == self.provider.default_base_url()
+    }
+
     pub fn base_url(&self) -> String {
         self.base_url
             .as_deref()
@@ -212,10 +252,11 @@ pub fn build_provider(
         ProviderId::OpenAi | ProviderId::DeepSeek => {
             Ok(Arc::new(openai::OpenAiProvider::new(cfg.clone(), http)))
         }
-        other => Err(LlmError::Config(format!(
-            "{} is not supported yet",
-            other.display_name()
+        ProviderId::Anthropic => Ok(Arc::new(anthropic::AnthropicProvider::new(
+            cfg.clone(),
+            http,
         ))),
+        ProviderId::Google => Ok(Arc::new(google::GoogleProvider::new(cfg.clone(), http))),
     }
 }
 

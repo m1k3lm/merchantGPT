@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, StreamEvent, Usage};
+use llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, ProviderContent, StopReason, StreamEvent,
+    ToolChoice, Usage,
+};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tools::{Mutability, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolResult};
@@ -25,7 +28,7 @@ impl AgentConfig {
         Self {
             model: model.into(),
             max_iterations: 10,
-            max_tokens: 4096,
+            max_tokens: 16_000,
             max_tool_result_chars: 20_000,
             turn_timeout: Duration::from_secs(300),
         }
@@ -177,6 +180,8 @@ pub enum AgentError {
     Cancelled,
     #[error("the turn took too long and was stopped")]
     TimedOut,
+    #[error("the AI provider declined this request; rephrase it or try another model")]
+    Refused,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,6 +201,13 @@ pub struct Agent<'a> {
 }
 
 const FORCED_ANSWER_NOTE: &str = "\n\nThe tool budget for this turn is exhausted. Answer the merchant now with what you already know, and say what is still missing.";
+
+struct Reply {
+    text: String,
+    calls: Vec<ToolCall>,
+    provider_content: Option<serde_json::Value>,
+    stop: StopReason,
+}
 
 enum Interrupt {
     Cancelled,
@@ -235,16 +247,17 @@ impl Agent<'_> {
                 messages: std::iter::once(ChatMessage::system(system))
                     .chain(history.iter().cloned())
                     .collect(),
-                tools: if forced {
-                    Vec::new()
+                tools: self.tools.definitions(),
+                tool_choice: if forced {
+                    ToolChoice::None
                 } else {
-                    self.tools.definitions()
+                    ToolChoice::Auto
                 },
                 max_tokens: self.config.max_tokens,
                 temperature: None,
             };
 
-            let (text, mut calls) = match self.stream_reply(req, ctx, deadline, &mut usage).await {
+            let reply = match self.stream_reply(req, ctx, deadline, &mut usage).await {
                 Ok(reply) => reply,
                 Err((partial, e)) => {
                     if !partial.is_empty() {
@@ -253,12 +266,27 @@ impl Agent<'_> {
                     return Err(e);
                 }
             };
-            if forced {
+            // Partial output from a declined request is not trustworthy.
+            if reply.stop == StopReason::Refusal {
+                return Err(AgentError::Refused);
+            }
+            let Reply {
+                text,
+                mut calls,
+                mut provider_content,
+                stop,
+            } = reply;
+            if forced && !calls.is_empty() {
                 calls.clear();
+                provider_content = None;
             }
             history.push(ChatMessage::Assistant {
                 text: text.clone(),
                 tool_calls: calls.clone(),
+                provider_content: provider_content.map(|content| ProviderContent {
+                    provider: self.provider.id(),
+                    content,
+                }),
             });
             if calls.is_empty() {
                 (self.sink)(AgentEvent::Finished { text: text.clone() });
@@ -267,6 +295,21 @@ impl Agent<'_> {
                     usage,
                     iterations: iteration + 1,
                 });
+            }
+
+            if stop == StopReason::MaxTokens {
+                // A call cut off by the output limit may carry truncated arguments.
+                let results = calls
+                    .iter()
+                    .map(|c| {
+                        ToolResult::error(
+                            &c.id,
+                            "not run: the reply hit the output token limit before this call was complete; retry with a smaller request",
+                        )
+                    })
+                    .collect();
+                history.push(ChatMessage::ToolResults { results });
+                continue;
             }
 
             let mut results = Vec::with_capacity(calls.len());
@@ -311,7 +354,7 @@ impl Agent<'_> {
         ctx: &ToolContext,
         deadline: Instant,
         usage: &mut Usage,
-    ) -> Result<(String, Vec<ToolCall>), (String, AgentError)> {
+    ) -> Result<Reply, (String, AgentError)> {
         let mut stream = match self.guarded(ctx, deadline, self.provider.stream(req)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err((String::new(), e.into())),
@@ -319,13 +362,20 @@ impl Agent<'_> {
         };
         let mut text = String::new();
         let mut calls = Vec::new();
+        let mut provider_content = None;
+        let mut stop = StopReason::EndTurn;
         loop {
             let next = match self.guarded(ctx, deadline, stream.next()).await {
                 Ok(n) => n,
                 Err(i) => return Err((text, i.into())),
             };
             match next {
-                None | Some(Ok(StreamEvent::Done(_))) => break,
+                None => break,
+                Some(Ok(StreamEvent::Done(s))) => {
+                    stop = s;
+                    break;
+                }
+                Some(Ok(StreamEvent::ProviderContent(c))) => provider_content = Some(c),
                 Some(Ok(StreamEvent::TextDelta(d))) => {
                     text.push_str(&d);
                     (self.sink)(AgentEvent::TextDelta(d));
@@ -339,7 +389,12 @@ impl Agent<'_> {
                 Some(Err(e)) => return Err((text, e.into())),
             }
         }
-        Ok((text, calls))
+        Ok(Reply {
+            text,
+            calls,
+            provider_content,
+            stop,
+        })
     }
 
     async fn execute(
@@ -688,7 +743,12 @@ mod tests {
         assert_eq!(out.text, "Partial answer");
         assert_eq!(out.iterations, 3);
         let last = h.provider.requests().pop().unwrap();
-        assert!(last.tools.is_empty());
+        assert_eq!(last.tool_choice, ToolChoice::None);
+        assert_eq!(
+            last.tools.len(),
+            3,
+            "history references tools, so they stay declared"
+        );
         assert!(
             matches!(&last.messages[0], ChatMessage::System { text } if text.contains("budget"))
         );
@@ -782,6 +842,73 @@ mod tests {
         assert!(results.iter().all(|r| r.is_error));
         assert!(results[0].content.contains("unknown tool"));
         assert!(results[1].content.contains("JSON object"));
+    }
+
+    #[tokio::test]
+    async fn refusal_runs_no_tools_and_keeps_partial_output_out_of_history() {
+        let h = Harness::new();
+        h.provider.push(vec![
+            StreamEvent::TextDelta("Sure, I".into()),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c".into(),
+                name: "change_thing".into(),
+                arguments: json!({}),
+            }),
+            StreamEvent::Done(StopReason::Refusal),
+        ]);
+        let mut history = user("do it");
+        let err = h
+            .run(&AlwaysApprove, &mut history, &ToolContext::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err, AgentError::Refused);
+        assert_eq!(history.len(), 1);
+        assert!(h.rec.audit.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn calls_cut_off_by_max_tokens_are_answered_but_not_run() {
+        let h = Harness::new();
+        h.provider
+            .push(vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c".into(),
+                    name: "change_thing".into(),
+                    arguments: json!({"price": "1"}),
+                }),
+                StreamEvent::Done(StopReason::MaxTokens),
+            ])
+            .push_text("Retrying later");
+        let mut history = user("do it");
+        h.run(&AlwaysApprove, &mut history, &ToolContext::default())
+            .await
+            .unwrap();
+        let results = tool_results(&history);
+        assert!(results[0].is_error && results[0].content.contains("token limit"));
+        assert!(h.rec.audit.lock().unwrap().is_empty(), "never executed");
+    }
+
+    #[tokio::test]
+    async fn provider_content_is_attached_to_the_assistant_message() {
+        let h = Harness::new();
+        h.provider.push(vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::ProviderContent(json!([{"type": "thinking", "signature": "s"}])),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]);
+        let mut history = user("hi");
+        h.run(&AlwaysApprove, &mut history, &ToolContext::default())
+            .await
+            .unwrap();
+        let ChatMessage::Assistant {
+            provider_content: Some(p),
+            ..
+        } = &history[1]
+        else {
+            panic!("{:?}", history[1]);
+        };
+        assert_eq!(p.provider, llm::ProviderId::OpenAi);
+        assert_eq!(p.content[0]["signature"], "s");
     }
 
     #[test]

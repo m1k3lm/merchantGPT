@@ -70,7 +70,7 @@ pub const TEMPLATE: &str = r#"# merchantGPT configuration. API keys are NOT read
 
 [agent]
 max_iterations = 10
-max_tokens = 4096
+max_tokens = 16000
 max_tool_result_chars = 20000
 turn_timeout_secs = 300
 
@@ -168,7 +168,7 @@ mod tests {
     fn partial_file_keeps_other_defaults() {
         let c = Config::parse("[agent]\nmax_iterations = 3\n").unwrap();
         assert_eq!(c.agent.max_iterations, 3);
-        assert_eq!(c.agent.max_tokens, 4096);
+        assert_eq!(c.agent.max_tokens, 16_000);
         assert_eq!(c.agent_config().max_iterations, 3);
     }
 
