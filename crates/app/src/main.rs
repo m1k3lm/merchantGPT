@@ -44,6 +44,16 @@ enum ConnectorFlow {
         url: String,
         values: Credentials,
     },
+    GoogleAds(GoogleAdsForm),
+}
+
+#[derive(Default)]
+struct GoogleAdsForm {
+    show_setup: bool,
+    client_id: String,
+    client_secret: String,
+    developer_token: String,
+    selected: Option<String>,
 }
 
 #[derive(Default)]
@@ -333,16 +343,23 @@ impl App {
                 }
                 for shop in &self.state.shops {
                     let active = Some(shop.id) == self.state.active_shop;
+                    let has_ads = shop.connectors.contains(&ConnectorKind::GoogleAds);
+                    let label = if has_ads {
+                        format!("{} · Ads", shop.label())
+                    } else {
+                        shop.label()
+                    };
                     let resp = ui
-                        .add_enabled(
-                            !self.state.busy,
-                            egui::Button::selectable(active, shop.label()),
-                        )
+                        .add_enabled(!self.state.busy, egui::Button::selectable(active, label))
                         .on_hover_text(&shop.url);
                     if resp.clicked() && !active {
                         cmds.push(Command::SelectShop(shop.id));
                     }
                     resp.context_menu(|ui| {
+                        if active && has_ads && ui.button("Unlink Google Ads").clicked() {
+                            cmds.push(Command::DisconnectConnector(ConnectorKind::GoogleAds));
+                            ui.close();
+                        }
                         if ui.button("Remove shop…").clicked() {
                             self.dialog = Dialog::RemoveShop {
                                 id: shop.id,
@@ -703,11 +720,32 @@ impl App {
                         if ui.button("Shop").clicked() {
                             next = Some(ConnectorFlow::PickPlatform);
                         }
-                        ui.weak("More connectors (ads, carriers) are coming.");
+                        let has_shop = self.state.active_shop.is_some();
+                        let google = ui
+                            .add_enabled(has_shop, egui::Button::new("Google Ads"))
+                            .on_hover_text("Draft campaigns in your Google Ads account")
+                            .on_disabled_hover_text(
+                                "Connect a shop first: Google Ads is linked to a shop",
+                            );
+                        if google.clicked() {
+                            next = Some(ConnectorFlow::GoogleAds(GoogleAdsForm {
+                                show_setup: !self.state.google_app_configured,
+                                client_id: self.state.google_app_client_id.clone(),
+                                ..Default::default()
+                            }));
+                        }
+                        ui.weak("More connectors (carriers) are coming.");
                         if ui.button("Cancel").clicked() {
                             next = Some(ConnectorFlow::Closed);
                         }
                     });
+            }
+            ConnectorFlow::GoogleAds(form) => {
+                let (close, cmd) = google_ads_window(ctx, form, &self.state);
+                connect = cmd;
+                if close {
+                    next = Some(ConnectorFlow::Closed);
+                }
             }
             ConnectorFlow::PickPlatform => {
                 egui::Window::new("Choose your platform")
@@ -896,6 +934,155 @@ impl App {
     }
 }
 
+/// The Google Ads connector: one-time app setup, then "Sign in with Google",
+/// then the account to link. Returns whether to close and a command to send.
+fn google_ads_window(
+    ctx: &egui::Context,
+    form: &mut GoogleAdsForm,
+    state: &AppState,
+) -> (bool, Option<Command>) {
+    use chat_core::GoogleSignInState as S;
+    let mut close = false;
+    let mut cmd = None;
+    let waiting = state.google_sign_in == S::Waiting;
+    egui::Window::new("Connect Google Ads")
+        .resizable(false)
+        .default_width(460.0)
+        .show(ctx, |ui| {
+            let shop = state.active_shop().map(|s| s.label()).unwrap_or_default();
+            ui.add(
+                egui::Label::new(format!(
+                    "Sign in with the Google account that manages your ads. The assistant will be able to read campaigns and create paused campaign drafts for {shop}; nothing runs until you enable it in Google Ads."
+                ))
+                .wrap(),
+            );
+            ui.add_space(6.0);
+
+            egui::CollapsingHeader::new("App credentials (one-time setup)")
+                .id_salt("google_app_setup")
+                .open(Some(form.show_setup))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("Whoever distributes merchantGPT creates these once: a Google Cloud OAuth client of type \"Desktop app\" with the Google Ads API enabled, and a developer token from the API Center of a Google Ads manager account.")
+                                .weak()
+                                .small(),
+                        )
+                        .wrap(),
+                    );
+                    let saved = |configured: bool| if configured { "saved; leave blank to keep" } else { "" };
+                    egui::Grid::new("google_app").num_columns(2).show(ui, |ui| {
+                        ui.label("OAuth client ID");
+                        ui.text_edit_singleline(&mut form.client_id);
+                        ui.end_row();
+                        ui.label("OAuth client secret");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.client_secret)
+                                .password(true)
+                                .hint_text(saved(state.google_app_configured)),
+                        );
+                        ui.end_row();
+                        ui.label("Developer token");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.developer_token)
+                                .password(true)
+                                .hint_text(saved(state.google_app_configured)),
+                        );
+                        ui.end_row();
+                    });
+                    let ready = !form.client_id.trim().is_empty()
+                        && (state.google_app_configured
+                            || (!form.client_secret.trim().is_empty()
+                                && !form.developer_token.trim().is_empty()));
+                    if ui.add_enabled(ready, egui::Button::new("Save")).clicked() {
+                        cmd = Some(Command::SaveGoogleAdsApp {
+                            client_id: form.client_id.clone(),
+                            client_secret: std::mem::take(&mut form.client_secret),
+                            developer_token: std::mem::take(&mut form.developer_token),
+                        });
+                        form.show_setup = false;
+                    }
+                });
+            if !form.show_setup && ui.small_button("Edit app credentials").clicked() {
+                form.show_setup = true;
+            }
+            ui.separator();
+
+            match &state.google_sign_in {
+                S::Waiting => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Finish signing in in your browser…");
+                    });
+                    if ui.button("Cancel sign-in").clicked() {
+                        cmd = Some(Command::CancelGoogleSignIn);
+                    }
+                }
+                S::Accounts(accounts) => {
+                    ui.strong("Choose the account to link");
+                    for a in accounts {
+                        let mut label = format!(
+                            "{}  ({})  {}",
+                            a.name,
+                            connectors::google_ads::format_customer_id(&a.customer_id),
+                            a.currency
+                        );
+                        if a.test_account {
+                            label.push_str("  · test account");
+                        }
+                        if a.manager {
+                            label.push_str("  · manager");
+                        }
+                        let selected = form.selected.as_deref() == Some(a.customer_id.as_str());
+                        let resp = ui
+                            .add_enabled(!a.manager, egui::Button::selectable(selected, label))
+                            .on_disabled_hover_text("Manager accounts cannot hold campaigns");
+                        if resp.clicked() {
+                            form.selected = Some(a.customer_id.clone());
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(form.selected.is_some(), egui::Button::new("Link account"))
+                            .clicked()
+                        {
+                            cmd = Some(Command::ConnectGoogleAds {
+                                customer_id: form.selected.clone().unwrap_or_default(),
+                            });
+                            close = true;
+                        }
+                        if ui.button("Use another Google account").clicked() {
+                            cmd = Some(Command::GoogleSignIn);
+                            form.selected = None;
+                        }
+                    });
+                }
+                S::Idle | S::Failed(_) => {
+                    if let S::Failed(e) = &state.google_sign_in {
+                        ui.colored_label(RED, e);
+                    }
+                    let button = egui::Button::new(RichText::new("Sign in with Google").strong())
+                        .min_size(egui::vec2(220.0, 32.0));
+                    if ui
+                        .add_enabled(state.google_app_configured, button)
+                        .on_disabled_hover_text("Save the app credentials first")
+                        .clicked()
+                    {
+                        cmd = Some(Command::GoogleSignIn);
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            if ui.button("Close").clicked() {
+                if waiting {
+                    cmd = Some(Command::CancelGoogleSignIn);
+                }
+                close = true;
+            }
+        });
+    (close, cmd)
+}
+
 fn render_item(
     ui: &mut egui::Ui,
     idx: usize,
@@ -1014,6 +1201,54 @@ mod tests {
         );
         f.provider = ProviderId::OpenAi;
         assert!(f.options().is_empty());
+    }
+
+    fn draw_google_window(state: &AppState, form: &mut GoogleAdsForm) -> (bool, Option<Command>) {
+        let ctx = egui::Context::default();
+        let mut result = (false, None);
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                result = google_ads_window(ui.ctx(), form, state);
+            });
+            out.textures_delta.clear();
+        }
+        result
+    }
+
+    #[test]
+    fn google_ads_window_renders_every_sign_in_state() {
+        use chat_core::GoogleSignInState as S;
+        use connectors::google_ads::AdsAccount;
+        let mut state = AppState::default();
+        let mut form = GoogleAdsForm {
+            show_setup: true,
+            ..Default::default()
+        };
+        let (close, cmd) = draw_google_window(&state, &mut form);
+        assert!(!close && cmd.is_none());
+
+        state.google_app_configured = true;
+        for s in [S::Idle, S::Waiting, S::Failed("denied".into())] {
+            state.google_sign_in = s;
+            let (close, cmd) = draw_google_window(&state, &mut form);
+            assert!(!close && cmd.is_none());
+        }
+
+        let account = |id: &str, manager: bool| AdsAccount {
+            customer_id: id.into(),
+            name: "Shop".into(),
+            currency: "EUR".into(),
+            manager,
+            test_account: false,
+            login_customer_id: None,
+        };
+        state.google_sign_in = S::Accounts(vec![
+            account("1234567890", false),
+            account("9999999999", true),
+        ]);
+        form.selected = Some("1234567890".into());
+        draw_google_window(&state, &mut form);
+        assert_eq!(form.selected.as_deref(), Some("1234567890"));
     }
 
     #[test]

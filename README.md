@@ -13,6 +13,7 @@ It is a native Rust application for macOS, Linux and Windows. There is no accoun
 - **Saved chats.** Conversations are kept and can be reopened, renamed or deleted.
 - **Memory.** The assistant can save short notes about you or your shop (for example "we ship on Mondays") and uses them in later chats. Saving a note also asks for approval.
 - **Skills.** Reusable instructions in a skills folder, run by typing `/skill-name` in the chat. A daily sales summary skill is installed on first run.
+- **Google Ads drafts.** Link a Google Ads account to a shop with **+ > Google Ads > Sign in with Google**. The assistant can then list campaigns with recent results and draft complete Search campaigns (budget, ad group, responsive search ad, keywords, countries). Drafts are always created paused: nothing runs or spends until you enable them in Google Ads.
 - **Scheduled tasks.** Run a prompt or a skill daily, weekly or every few hours. Scheduled runs can read the shop but never change it; their reports appear in a "Task: ..." chat.
 
 ### Supported platforms and AI providers
@@ -72,6 +73,17 @@ docker compose run --rm dev cargo build --release
 
 - **WooCommerce:** in the WordPress admin go to WooCommerce > Settings > Advanced > REST API, add a key with Read/Write permission, and copy the consumer key and secret. HTTPS stores use Basic auth; plain-HTTP stores are signed with OAuth 1.0a automatically.
 - **Magento 2:** go to System > Integrations, add an integration with API access to Catalog, Sales and Customers, activate it and copy the **Access Token** (the other three values are not used). On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" to Yes. Integration tokens do not expire; rotate one with **Reauthorize**.
+
+### Google Ads
+
+Click **+**, then **Google Ads** (a shop must be selected; the ads account is linked to it), then **Sign in with Google**. Your browser opens Google's consent page; after you allow access, pick the Google Ads account to link. Client accounts under a manager account are listed too.
+
+The first time, the window asks for the app credentials, which whoever distributes merchantGPT creates once and which are then stored encrypted:
+
+- An **OAuth client** (client ID and secret) of type "Desktop app" in a Google Cloud project with the Google Ads API enabled.
+- A **developer token** from the API Center of a Google Ads manager account. Until Google approves it for Basic access, it only works with test accounts.
+
+To unlink, right-click the shop and choose **Unlink Google Ads**.
 
 ### Where things are stored
 
@@ -168,6 +180,6 @@ docker volume rm merchantgpt_woo-db merchantgpt_woo-html
 ## Known limitations
 
 - Shopify and PrestaShop are placeholders.
-- The Magento connector has not yet been verified against a live store.
+- The Magento and Google Ads connectors have not yet been verified against a live store or account.
 - Windows binaries are not produced yet; build on Windows directly or add a CI runner.
 - Shared or published builds must be hosted on seQura's `tech-ai-tools` S3 bucket (request access in Slack #ai-tools).

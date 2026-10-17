@@ -58,6 +58,10 @@ impl Runtime {
         });
         let mut backend = Backend::new(sink, factory, Arc::new(ReqwestTransport::new(http)), store)
             .with_agent_defaults(config.agent_config())
+            .with_command_sender(cmd_tx.clone())
+            .with_browser_opener(Arc::new(|url: &str| {
+                let _ = open::that_detached(url);
+            }))
             .with_skills(skills, skill_errors.iter().map(|e| e.to_string()).collect());
         rt.spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {

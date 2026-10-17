@@ -21,3 +21,4 @@ reqwest = "0.13.5"
 serde_json = "1.0.154"
 egui_commonmark = { version = "0.26.0", default-features = false, features = ["pulldown_cmark"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+open = "5.4.4"

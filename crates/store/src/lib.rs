@@ -19,6 +19,7 @@ pub use repo::*;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_llm_options.sql"),
+    include_str!("../migrations/0003_app_settings.sql"),
 ];
 
 #[derive(Debug, thiserror::Error)]

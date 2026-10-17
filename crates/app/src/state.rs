@@ -3,7 +3,7 @@
 
 use chat_core::{
     AgentEvent, AuditSummary, BackendEvent, Command, ConversationSummary, Decision,
-    LlmSettingSummary, Responder, ShopSummary, SkillSummary, TaskSummary,
+    GoogleSignInState, LlmSettingSummary, Responder, ShopSummary, SkillSummary, TaskSummary,
 };
 use llm::{ChatMessage, ProviderId, Usage};
 use tools::{CancellationToken, Mutability, ToolCall};
@@ -59,6 +59,9 @@ pub struct AppState {
     pub skills: Vec<SkillSummary>,
     pub tasks: Vec<TaskSummary>,
     pub audit: Vec<AuditSummary>,
+    pub google_app_configured: bool,
+    pub google_app_client_id: String,
+    pub google_sign_in: GoogleSignInState,
 }
 
 pub fn pretty_args(v: &serde_json::Value) -> String {
@@ -219,6 +222,14 @@ impl AppState {
             BackendEvent::Skills(s) => self.skills = s,
             BackendEvent::Tasks(t) => self.tasks = t,
             BackendEvent::Audit(rows) => self.audit = rows,
+            BackendEvent::GoogleAdsApp {
+                configured,
+                client_id,
+            } => {
+                self.google_app_configured = configured;
+                self.google_app_client_id = client_id;
+            }
+            BackendEvent::GoogleSignIn(s) => self.google_sign_in = s,
             BackendEvent::TaskFinished { name, error } => self.items.push(match error {
                 None => ChatItem::Notice(format!(
                     "Scheduled task \"{name}\" finished; its report is in the \"Task: {name}\" chat."
@@ -402,6 +413,20 @@ mod tests {
         assert_eq!(s.skill_suggestions("/da")[0].name, "daily-sales");
         assert!(s.skill_suggestions("/daily-sales now").is_empty());
         assert!(s.skill_suggestions("hello").is_empty());
+    }
+
+    #[test]
+    fn google_ads_events_update_sign_in_state() {
+        let mut s = AppState::default();
+        assert_eq!(s.google_sign_in, GoogleSignInState::Idle);
+        s.apply(BackendEvent::GoogleAdsApp {
+            configured: true,
+            client_id: "cid".into(),
+        });
+        s.apply(BackendEvent::GoogleSignIn(GoogleSignInState::Waiting));
+        assert!(s.google_app_configured);
+        assert_eq!(s.google_app_client_id, "cid");
+        assert_eq!(s.google_sign_in, GoogleSignInState::Waiting);
     }
 
     #[test]

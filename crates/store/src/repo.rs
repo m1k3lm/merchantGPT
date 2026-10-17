@@ -239,6 +239,35 @@ impl Store {
             .collect()
     }
 
+    pub fn delete_credentials(&self, shop_id: i64, kind: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM connector_credentials WHERE shop_id = ?1 AND kind = ?2",
+            params![shop_id, kind],
+        )? > 0)
+    }
+
+    // --- app settings ------------------------------------------------------
+
+    pub fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            params![key, value, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn app_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     // --- LLM settings ------------------------------------------------------
 
     /// Saves settings for one provider; if `active`, it becomes the only active one.
@@ -554,6 +583,24 @@ mod tests {
         );
         s.delete_shop(a.id).unwrap();
         assert!(s.credentials(a.id).unwrap().is_empty(), "cascade");
+    }
+
+    #[test]
+    fn app_settings_and_single_connector_removal() {
+        let s = store();
+        assert_eq!(s.app_setting("k").unwrap(), None);
+        s.set_app_setting("k", "v1").unwrap();
+        s.set_app_setting("k", "v2").unwrap();
+        assert_eq!(s.app_setting("k").unwrap().as_deref(), Some("v2"));
+
+        let shop = s.upsert_shop("https://a.test", None).unwrap().id;
+        s.save_credentials(shop, "shop:woocommerce", &BTreeMap::new())
+            .unwrap();
+        s.save_credentials(shop, "ads:google", &BTreeMap::new())
+            .unwrap();
+        assert!(s.delete_credentials(shop, "ads:google").unwrap());
+        assert!(!s.delete_credentials(shop, "ads:google").unwrap());
+        assert_eq!(s.credentials(shop).unwrap().len(), 1);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub struct CredentialField {
     pub key: &'static str,
     pub label: &'static str,
     pub secret: bool,
+    pub required: bool,
 }
 
 impl CredentialField {
@@ -17,7 +18,13 @@ impl CredentialField {
             key,
             label,
             secret: false,
+            required: true,
         }
+    }
+
+    pub fn optional(mut self) -> Self {
+        self.required = false;
+        self
     }
 
     pub fn secret(key: &'static str, label: &'static str) -> Self {
@@ -25,6 +32,7 @@ impl CredentialField {
             key,
             label,
             secret: true,
+            required: true,
         }
     }
 }
@@ -58,7 +66,7 @@ impl CredentialSchema {
     pub fn missing(&self, creds: &Credentials) -> Vec<&'static str> {
         self.fields
             .iter()
-            .filter(|f| creds.get(f.key).is_none_or(|v| v.trim().is_empty()))
+            .filter(|f| f.required && creds.get(f.key).is_none_or(|v| v.trim().is_empty()))
             .map(|f| f.label)
             .collect()
     }

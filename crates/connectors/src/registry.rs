@@ -18,7 +18,11 @@ const MAGENTO_HELP: &str = "In the Magento admin: System > Integrations > Add Ne
 
 impl ConnectorRegistry {
     pub fn kinds() -> Vec<ConnectorKind> {
-        Platform::ALL.into_iter().map(ConnectorKind::Shop).collect()
+        Platform::ALL
+            .into_iter()
+            .map(ConnectorKind::Shop)
+            .chain([ConnectorKind::GoogleAds])
+            .collect()
     }
 
     pub fn credential_schema(kind: ConnectorKind) -> CredentialSchema {
@@ -33,6 +37,17 @@ impl ConnectorRegistry {
             }
             ConnectorKind::Shop(Platform::PrestaShop) => {
                 CredentialSchema::new(vec![F::secret("webservice_key", "Webservice key")])
+            }
+            ConnectorKind::GoogleAds => {
+                use crate::google_ads as g;
+                CredentialSchema::new(vec![
+                    F::text(g::CLIENT_ID, "OAuth client ID"),
+                    F::secret(g::CLIENT_SECRET, "OAuth client secret"),
+                    F::secret(g::DEVELOPER_TOKEN, "Developer token"),
+                    F::secret(g::REFRESH_TOKEN, "Refresh token"),
+                    F::text(g::CUSTOMER_ID, "Customer ID"),
+                    F::text(g::LOGIN_CUSTOMER_ID, "Manager customer ID").optional(),
+                ])
             }
             ConnectorKind::Shop(Platform::Shopify) => {
                 CredentialSchema::new(vec![F::secret("access_token", "Admin API access token")])
@@ -53,7 +68,14 @@ impl ConnectorRegistry {
                 missing.join(", ")
             )));
         }
+        if kind == ConnectorKind::GoogleAds {
+            return Ok(Arc::new(crate::google_ads::GoogleAds::from_credentials(
+                credentials,
+                transport,
+            )?));
+        }
         let shop: Arc<dyn crate::ShopConnector> = match kind {
+            ConnectorKind::GoogleAds => unreachable!("handled above"),
             ConnectorKind::Shop(Platform::WooCommerce) => {
                 Arc::new(WooCommerce::new(base_url, credentials, transport))
             }

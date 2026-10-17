@@ -1,7 +1,8 @@
 //! Connectors to external services. A connector contributes tools to the agent;
-//! shop platforms are one kind, ad platforms and carriers are future kinds.
+//! shop platforms are one kind, Google Ads another; carriers are future kinds.
 
 pub mod domain;
+pub mod google_ads;
 pub mod magento;
 pub mod platform;
 pub mod registry;
@@ -28,12 +29,14 @@ pub use transport::{HttpTransport, ReqwestTransport};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConnectorKind {
     Shop(Platform),
+    GoogleAds,
 }
 
 impl ConnectorKind {
     pub fn id(self) -> String {
         match self {
             ConnectorKind::Shop(p) => format!("shop:{}", p.id()),
+            ConnectorKind::GoogleAds => "ads:google".into(),
         }
     }
 
@@ -41,6 +44,7 @@ impl ConnectorKind {
         let (family, rest) = id.split_once(':')?;
         match family {
             "shop" => Platform::parse(rest).map(ConnectorKind::Shop),
+            "ads" if rest == "google" => Some(ConnectorKind::GoogleAds),
             _ => None,
         }
     }
@@ -48,7 +52,12 @@ impl ConnectorKind {
     pub fn display_name(self) -> String {
         match self {
             ConnectorKind::Shop(p) => format!("{} shop", p.display_name()),
+            ConnectorKind::GoogleAds => "Google Ads".into(),
         }
+    }
+
+    pub fn is_shop(self) -> bool {
+        matches!(self, ConnectorKind::Shop(_))
     }
 }
 
@@ -94,7 +103,11 @@ mod tests {
             let k = ConnectorKind::Shop(p);
             assert_eq!(ConnectorKind::parse(&k.id()), Some(k));
         }
-        assert_eq!(ConnectorKind::parse("ads:google"), None);
+        assert_eq!(
+            ConnectorKind::parse(&ConnectorKind::GoogleAds.id()),
+            Some(ConnectorKind::GoogleAds)
+        );
+        assert_eq!(ConnectorKind::parse("ads:bing"), None);
         assert_eq!(ConnectorKind::parse("nonsense"), None);
     }
 }

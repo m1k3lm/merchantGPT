@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use connectors::google_ads::{AdsAccount, AdsAuth, AdsClient};
 use connectors::{
     Connector, ConnectorError, ConnectorKind, ConnectorRegistry, Credentials, HttpTransport,
 };
@@ -60,6 +61,24 @@ pub enum Command {
     RunTaskNow(i64),
     /// Loads the active shop's audit log (newest first).
     LoadAudit,
+    /// Saves the app's Google OAuth client and developer token; blank secrets
+    /// keep the saved ones.
+    SaveGoogleAdsApp {
+        client_id: String,
+        client_secret: String,
+        developer_token: String,
+    },
+    /// Opens Google's consent page and waits for the merchant to sign in.
+    GoogleSignIn,
+    CancelGoogleSignIn,
+    /// Posted by the sign-in task: the refresh token, or why it failed.
+    GoogleSignInFinished(Result<Secret, String>),
+    /// Links the chosen Google Ads account to the active shop.
+    ConnectGoogleAds {
+        customer_id: String,
+    },
+    /// Unlinks a non-shop connector (e.g. Google Ads) from the active shop.
+    DisconnectConnector(ConnectorKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +106,8 @@ pub struct ShopSummary {
     pub url: String,
     pub name: Option<String>,
     pub kind: Option<ConnectorKind>,
+    /// Every connector linked to the shop, the shop platform included.
+    pub connectors: Vec<ConnectorKind>,
 }
 
 impl ShopSummary {
@@ -149,6 +170,12 @@ pub enum BackendEvent {
         error: Option<String>,
     },
     Audit(Vec<AuditSummary>),
+    /// Whether the Google Ads app credentials are set up (secrets never sent).
+    GoogleAdsApp {
+        configured: bool,
+        client_id: String,
+    },
+    GoogleSignIn(GoogleSignInState),
     Shops {
         shops: Vec<ShopSummary>,
         active: Option<i64>,
@@ -173,7 +200,8 @@ struct ActiveShop {
     id: i64,
     url: String,
     name: Option<String>,
-    connector: Option<Arc<dyn Connector>>,
+    /// The shop platform plus any linked services (e.g. Google Ads).
+    connectors: Vec<Arc<dyn Connector>>,
 }
 
 pub struct Backend {
@@ -189,6 +217,48 @@ pub struct Backend {
     history: Vec<ChatMessage>,
     skills: Arc<Vec<Skill>>,
     skill_errors: Vec<String>,
+    /// Lets background work (Google sign-in) post its result into the queue.
+    commands: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
+    open_browser: Arc<dyn Fn(&str) + Send + Sync>,
+    google_sign_in: Option<CancellationToken>,
+    google_pending: Option<GooglePending>,
+}
+
+/// A finished Google sign-in waiting for the merchant to pick an account.
+struct GooglePending {
+    app: GoogleApp,
+    refresh_token: String,
+    accounts: Vec<AdsAccount>,
+}
+
+/// The app's Google OAuth client and developer token, set up once.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct GoogleApp {
+    client_id: String,
+    client_secret: String,
+    developer_token: String,
+}
+
+const GOOGLE_APP_KEY: &str = "google_ads_app";
+const GOOGLE_SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A secret carried through a `Command`; its Debug output never shows the value.
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GoogleSignInState {
+    #[default]
+    Idle,
+    /// The consent page is open in the browser.
+    Waiting,
+    Accounts(Vec<AdsAccount>),
+    Failed(String),
 }
 
 /// Notes beyond this many are left out of the system prompt (newest kept).
@@ -263,9 +333,24 @@ impl Backend {
             history: Vec::new(),
             skills: Arc::new(Vec::new()),
             skill_errors: Vec::new(),
+            commands: None,
+            open_browser: Arc::new(|_| {}),
+            google_sign_in: None,
+            google_pending: None,
         };
         backend.rebuild_tools();
         backend
+    }
+
+    pub fn with_command_sender(mut self, tx: tokio::sync::mpsc::UnboundedSender<Command>) -> Self {
+        self.commands = Some(tx);
+        self
+    }
+
+    /// How to show a URL to the merchant (the system browser in the app).
+    pub fn with_browser_opener(mut self, open: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.open_browser = open;
+        self
     }
 
     pub fn with_skills(mut self, skills: Vec<Skill>, errors: Vec<String>) -> Self {
@@ -332,6 +417,12 @@ impl Backend {
         for r in self.store.llm_settings().unwrap_or_default() {
             secrets.extend(secret_options(&r.options));
             secrets.push(r.api_key);
+        }
+        if let Ok(Some(app)) = self.google_app() {
+            secrets.extend([app.client_secret, app.developer_token]);
+        }
+        if let Some(p) = &self.google_pending {
+            secrets.push(p.refresh_token.clone());
         }
         for shop in self.store.list_shops().unwrap_or_default() {
             for row in self.store.credentials(shop.id).unwrap_or_default() {
@@ -404,6 +495,27 @@ impl Backend {
                 .map_err(err)
                 .and_then(|_| self.emit_tasks()),
             Command::LoadAudit => self.load_audit(),
+            Command::SaveGoogleAdsApp {
+                client_id,
+                client_secret,
+                developer_token,
+            } => self.save_google_app(&client_id, &client_secret, &developer_token),
+            Command::GoogleSignIn => self.start_google_sign_in(),
+            Command::CancelGoogleSignIn => {
+                if let Some(c) = self.google_sign_in.take() {
+                    c.cancel();
+                }
+                self.emit(BackendEvent::GoogleSignIn(GoogleSignInState::Idle));
+                Ok(())
+            }
+            Command::GoogleSignInFinished(result) => {
+                self.finish_google_sign_in(result).await;
+                Ok(())
+            }
+            Command::ConnectGoogleAds { customer_id } => {
+                self.connect_google_ads(&customer_id).await
+            }
+            Command::DisconnectConnector(kind) => self.disconnect_connector(kind),
             Command::RunTaskNow(id) => {
                 match self
                     .store
@@ -427,6 +539,7 @@ impl Backend {
     }
 
     fn init(&mut self) -> Res<()> {
+        self.emit_google_app()?;
         self.emit(BackendEvent::Skills(
             self.skills
                 .iter()
@@ -587,19 +700,22 @@ impl Backend {
             }))
     }
 
-    fn build_connector(&self, shop_id: i64, url: &str) -> Res<Option<Arc<dyn Connector>>> {
-        let Some((kind, creds)) = self.shop_kind(shop_id)? else {
-            return Ok(None);
-        };
-        match ConnectorRegistry::build(kind, url, &creds, self.transport.clone()) {
-            Ok(c) => Ok(Some(c)),
-            Err(e) => {
-                self.emit(BackendEvent::Error(format!(
-                    "Saved credentials for {url} are unusable: {e}"
-                )));
-                Ok(None)
+    /// Every connector saved for the shop; unusable ones are reported and skipped.
+    fn build_connectors(&self, shop_id: i64, url: &str) -> Res<Vec<Arc<dyn Connector>>> {
+        let mut out = Vec::new();
+        for row in self.store.credentials(shop_id).map_err(err)? {
+            let Some(kind) = ConnectorKind::parse(&row.kind) else {
+                continue;
+            };
+            match ConnectorRegistry::build(kind, url, &row.credentials, self.transport.clone()) {
+                Ok(c) => out.push(c),
+                Err(e) => self.emit(BackendEvent::Error(format!(
+                    "Saved {} credentials for {url} are unusable: {e}",
+                    kind.display_name()
+                ))),
             }
         }
+        Ok(out)
     }
 
     fn select_shop(&mut self, id: i64) -> Res<()> {
@@ -608,13 +724,13 @@ impl Backend {
             .shop(id)
             .map_err(err)?
             .ok_or_else(|| format!("shop {id} no longer exists"))?;
-        let connector = self.build_connector(id, &row.url)?;
+        let connectors = self.build_connectors(id, &row.url)?;
         self.store.touch_shop(id).map_err(err)?;
         self.shop = Some(ActiveShop {
             id,
             url: row.url,
             name: row.name,
-            connector,
+            connectors,
         });
         self.rebuild_tools();
         self.emit_shops()?;
@@ -637,17 +753,17 @@ impl Backend {
     }
 
     fn rebuild_tools(&mut self) {
-        let connector = self.shop.as_ref().and_then(|s| s.connector.clone());
-        self.tools = self.tools_for(self.active_shop_id(), connector.as_ref());
+        let connectors = self
+            .shop
+            .as_ref()
+            .map(|s| s.connectors.clone())
+            .unwrap_or_default();
+        self.tools = self.tools_for(self.active_shop_id(), &connectors);
     }
 
-    fn tools_for(
-        &self,
-        shop_id: Option<i64>,
-        connector: Option<&Arc<dyn Connector>>,
-    ) -> ToolRegistry {
+    fn tools_for(&self, shop_id: Option<i64>, connectors: &[Arc<dyn Connector>]) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
-        if let Some(c) = connector {
+        for c in connectors {
             tools.extend(c.tools());
         }
         tools.extend(skills::skill_tools(
@@ -667,11 +783,19 @@ impl Backend {
             .into_iter()
             .map(|s| {
                 let kind = self.shop_kind(s.id).ok().flatten().map(|(k, _)| k);
+                let connectors = self
+                    .store
+                    .credentials(s.id)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|r| ConnectorKind::parse(&r.kind))
+                    .collect();
                 ShopSummary {
                     id: s.id,
                     url: s.url,
                     name: s.name,
                     kind,
+                    connectors,
                 }
             })
             .collect();
@@ -779,7 +903,7 @@ impl Backend {
             shop.map(|s| s.id),
             shop.map(|s| s.url.clone()),
             shop.and_then(|s| s.name.clone()),
-            shop.and_then(|s| s.connector.as_ref()),
+            shop.map(|s| s.connectors.as_slice()).unwrap_or_default(),
         )
     }
 
@@ -788,7 +912,7 @@ impl Backend {
         shop_id: Option<i64>,
         url: Option<String>,
         name: Option<String>,
-        connector: Option<&Arc<dyn Connector>>,
+        connectors: &[Arc<dyn Connector>],
     ) -> PromptContext {
         let notes = self.store.memory_notes(shop_id).unwrap_or_default();
         let skip = notes.len().saturating_sub(MAX_PROMPT_NOTES);
@@ -796,7 +920,7 @@ impl Backend {
             today: Some(chrono::Local::now().date_naive()),
             shop_name: name,
             shop_url: url,
-            connectors: connector.iter().map(|c| c.kind().display_name()).collect(),
+            connectors: connectors.iter().map(|c| c.kind().display_name()).collect(),
             skills: self
                 .skills
                 .iter()
@@ -1009,8 +1133,8 @@ impl Backend {
             .shop(task.shop_id)
             .map_err(err)?
             .ok_or("the task's shop no longer exists")?;
-        let connector = self.build_connector(shop.id, &shop.url)?;
-        let tools = self.tools_for(Some(shop.id), connector.as_ref());
+        let connectors = self.build_connectors(shop.id, &shop.url)?;
+        let tools = self.tools_for(Some(shop.id), &connectors);
         let conversation = match task.conversation_id {
             Some(id) if self.store.conversation(id).map_err(err)?.is_some() => id,
             _ => self
@@ -1062,7 +1186,7 @@ impl Backend {
                 Some(shop.id),
                 Some(shop.url.clone()),
                 shop.name.clone(),
-                connector.as_ref(),
+                &connectors,
             ))
         );
         let agent = Agent {
@@ -1090,6 +1214,217 @@ impl Backend {
             self.open_conversation(conversation)?;
         }
         outcome.map(|_| ()).map_err(err)
+    }
+}
+
+impl Backend {
+    fn google_app(&self) -> Res<Option<GoogleApp>> {
+        self.store
+            .app_setting(GOOGLE_APP_KEY)
+            .map_err(err)?
+            .map(|json| serde_json::from_str(&json).map_err(err))
+            .transpose()
+    }
+
+    fn emit_google_app(&self) -> Res<()> {
+        let app = self.google_app()?;
+        self.emit(BackendEvent::GoogleAdsApp {
+            configured: app.is_some(),
+            client_id: app.map(|a| a.client_id).unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    fn save_google_app(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        developer_token: &str,
+    ) -> Res<()> {
+        let saved = self.google_app()?.unwrap_or_default();
+        let keep = |new: &str, old: String| {
+            if new.trim().is_empty() {
+                old
+            } else {
+                new.trim().to_string()
+            }
+        };
+        let app = GoogleApp {
+            client_id: keep(client_id, saved.client_id),
+            client_secret: keep(client_secret, saved.client_secret),
+            developer_token: keep(developer_token, saved.developer_token),
+        };
+        if app.client_id.is_empty()
+            || app.client_secret.is_empty()
+            || app.developer_token.is_empty()
+        {
+            return Err("Enter the OAuth client ID, client secret and developer token.".into());
+        }
+        self.store
+            .set_app_setting(GOOGLE_APP_KEY, &serde_json::to_string(&app).map_err(err)?)
+            .map_err(err)?;
+        self.emit_google_app()
+    }
+
+    fn start_google_sign_in(&mut self) -> Res<()> {
+        if self.active_shop_id().is_none() {
+            return Err("Connect a shop first: Google Ads is linked to a shop.".into());
+        }
+        let app = self
+            .google_app()?
+            .ok_or("Set up the Google Ads app credentials first.")?;
+        let tx = self
+            .commands
+            .clone()
+            .ok_or("Google sign-in is not available in this build.")?;
+        if let Some(previous) = self.google_sign_in.take() {
+            previous.cancel();
+        }
+        let cancel = CancellationToken::new();
+        self.google_sign_in = Some(cancel.clone());
+        self.google_pending = None;
+        self.emit(BackendEvent::GoogleSignIn(GoogleSignInState::Waiting));
+        let transport = self.transport.clone();
+        let open = self.open_browser.clone();
+        tokio::spawn(async move {
+            let client = connectors::google_ads::OAuthClient {
+                client_id: app.client_id,
+                client_secret: app.client_secret,
+            };
+            let result = connectors::google_ads::oauth::authorize(
+                transport.as_ref(),
+                &Default::default(),
+                &client,
+                move |url: &str| open(url),
+                cancel,
+                GOOGLE_SIGN_IN_TIMEOUT,
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|t| {
+                t.refresh_token
+                    .map(Secret)
+                    .ok_or_else(|| "no refresh token".into())
+            });
+            let _ = tx.send(Command::GoogleSignInFinished(result));
+        });
+        Ok(())
+    }
+
+    async fn finish_google_sign_in(&mut self, result: Result<Secret, String>) {
+        self.google_sign_in = None;
+        let state = match self.load_google_accounts(result).await {
+            Ok(accounts) => GoogleSignInState::Accounts(accounts),
+            Err(e) => GoogleSignInState::Failed(self.redactor().apply(&e)),
+        };
+        self.emit(BackendEvent::GoogleSignIn(state));
+    }
+
+    async fn load_google_accounts(
+        &mut self,
+        result: Result<Secret, String>,
+    ) -> Res<Vec<AdsAccount>> {
+        let refresh_token = result?.0;
+        let app = self
+            .google_app()?
+            .ok_or("the Google Ads app setup was removed")?;
+        let client = AdsClient::new(
+            AdsAuth {
+                client: connectors::google_ads::OAuthClient {
+                    client_id: app.client_id.clone(),
+                    client_secret: app.client_secret.clone(),
+                },
+                developer_token: app.developer_token.clone(),
+                refresh_token: refresh_token.clone(),
+            },
+            self.transport.clone(),
+        );
+        let accounts = connectors::google_ads::list_accounts(&client)
+            .await
+            .map_err(err)?;
+        if accounts.is_empty() {
+            return Err("This Google user has no Google Ads accounts.".into());
+        }
+        self.google_pending = Some(GooglePending {
+            app,
+            refresh_token,
+            accounts: accounts.clone(),
+        });
+        Ok(accounts)
+    }
+
+    async fn connect_google_ads(&mut self, customer_id: &str) -> Res<()> {
+        use connectors::google_ads as g;
+        let shop = self
+            .shop
+            .as_ref()
+            .map(|s| (s.id, s.url.clone()))
+            .ok_or("Connect a shop first.")?;
+        let pending = self
+            .google_pending
+            .as_ref()
+            .ok_or("Sign in with Google first.")?;
+        let id = g::normalize_customer_id(customer_id).map_err(err)?;
+        let account = pending
+            .accounts
+            .iter()
+            .find(|a| a.customer_id == id)
+            .ok_or("That account is not one this Google user can access.")?;
+        if account.manager {
+            return Err(
+                "Manager accounts cannot hold campaigns; pick one of its client accounts.".into(),
+            );
+        }
+        let mut creds = Credentials::from([
+            (g::CLIENT_ID.to_string(), pending.app.client_id.clone()),
+            (
+                g::CLIENT_SECRET.to_string(),
+                pending.app.client_secret.clone(),
+            ),
+            (
+                g::DEVELOPER_TOKEN.to_string(),
+                pending.app.developer_token.clone(),
+            ),
+            (g::REFRESH_TOKEN.to_string(), pending.refresh_token.clone()),
+            (g::CUSTOMER_ID.to_string(), id.clone()),
+        ]);
+        if let Some(login) = &account.login_customer_id {
+            creds.insert(g::LOGIN_CUSTOMER_ID.to_string(), login.clone());
+        }
+        let name = account.name.clone();
+        let connector = ConnectorRegistry::build(
+            ConnectorKind::GoogleAds,
+            &shop.1,
+            &creds,
+            self.transport.clone(),
+        )
+        .map_err(err)?;
+        connector.verify().await.map_err(err)?;
+        self.store
+            .save_credentials(shop.0, &ConnectorKind::GoogleAds.id(), &creds)
+            .map_err(err)?;
+        self.google_pending = None;
+        self.emit(BackendEvent::GoogleSignIn(GoogleSignInState::Idle));
+        self.emit(BackendEvent::Notice(format!(
+            "Google Ads account {name} ({}) linked to this shop. Campaigns the assistant drafts are created paused.",
+            g::format_customer_id(&id)
+        )));
+        self.select_shop(shop.0)
+    }
+
+    fn disconnect_connector(&mut self, kind: ConnectorKind) -> Res<()> {
+        if kind.is_shop() {
+            return Err("Remove the shop instead.".into());
+        }
+        let shop = self.active_shop_id().ok_or("No shop is selected.")?;
+        self.store
+            .delete_credentials(shop, &kind.id())
+            .map_err(err)?;
+        self.emit(BackendEvent::Notice(format!(
+            "{} unlinked from this shop.",
+            kind.display_name()
+        )));
+        self.select_shop(shop)
     }
 }
 
@@ -1125,6 +1460,7 @@ mod tests {
         events: Arc<Mutex<Vec<BackendEvent>>>,
         provider: Arc<FakeProvider>,
         store: Store,
+        transport: Arc<FakeTransport>,
     }
 
     fn fixture_with(store: Store) -> Fixture {
@@ -1132,6 +1468,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new());
         let ev = events.clone();
         let p = provider.clone();
+        let transport = Arc::new(FakeTransport::new());
         let backend = Backend::new(
             Arc::new(move |e| {
                 if let BackendEvent::Agent(AgentEvent::ConfirmationRequested {
@@ -1143,7 +1480,7 @@ mod tests {
                 ev.lock().unwrap().push(e)
             }),
             Arc::new(move |_| Ok(p.clone() as Arc<dyn LlmProvider>)),
-            Arc::new(FakeTransport::new()),
+            transport.clone(),
             store.clone(),
         );
         Fixture {
@@ -1151,6 +1488,7 @@ mod tests {
             events,
             provider,
             store,
+            transport,
         }
     }
 
@@ -1721,6 +2059,157 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].stage, "failed", "newest first");
         assert_eq!(rows[1].tool, "shop_update_order_status");
+    }
+
+    /// Google endpoints for one user with a single client account 1234567890.
+    fn google_routes(t: &FakeTransport) {
+        use connectors::transport::{HttpResponse, Method};
+        t.on(
+            Method::Post,
+            "/token",
+            HttpResponse::new(200, r#"{"access_token":"ya29.x","expires_in":3600,"refresh_token":"1//refresh-secret"}"#),
+        );
+        t.on(
+            Method::Get,
+            "/v26/customers:listAccessibleCustomers",
+            HttpResponse::new(200, r#"{"resourceNames":["customers/1234567890"]}"#),
+        );
+        t.on(
+            Method::Post,
+            "/v26/customers/1234567890/googleAds:search",
+            HttpResponse::new(200, r#"{"results":[{"customer":{"id":"1234567890","descriptiveName":"Hoodies ES","currencyCode":"EUR","manager":false}}]}"#),
+        );
+    }
+
+    /// Plays the browser: approves the consent and follows the redirect.
+    fn approving_browser() -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(|url: &str| {
+            let q: std::collections::HashMap<_, _> = reqwest::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .into_owned()
+                .collect();
+            let target = format!("{}/?code=4%2Fok&state={}", q["redirect_uri"], q["state"]);
+            tokio::spawn(async move {
+                let _ = reqwest::get(target).await;
+            });
+        })
+    }
+
+    #[tokio::test]
+    async fn google_ads_sign_in_lists_accounts_and_links_the_chosen_one() {
+        let mut f = fixture();
+        google_routes(&f.transport);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        f.backend.commands = Some(tx);
+        f.backend.open_browser = approving_browser();
+
+        f.backend.handle(Command::GoogleSignIn).await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("Connect a shop")),
+            "Google Ads belongs to a shop"
+        );
+        f.connect("a.test", Platform::Shopify).await;
+        f.backend.handle(Command::GoogleSignIn).await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("app credentials"))
+        );
+
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid.apps.googleusercontent.com".into(),
+                client_secret: "GOCSPX-secret".into(),
+                developer_token: "devtoken-secret".into(),
+            })
+            .await;
+        f.backend.handle(Command::GoogleSignIn).await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::GoogleSignIn(GoogleSignInState::Waiting))
+        ));
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !format!("{finished:?}").contains("refresh-secret"),
+            "tokens never appear in Debug output"
+        );
+        f.backend.handle(finished).await;
+        let Some(BackendEvent::GoogleSignIn(GoogleSignInState::Accounts(accounts))) =
+            f.events().last().cloned()
+        else {
+            panic!("{:?}", f.events().last());
+        };
+        assert_eq!(accounts[0].name, "Hoodies ES");
+
+        f.backend
+            .handle(Command::ConnectGoogleAds {
+                customer_id: "123-456-7890".into(),
+            })
+            .await;
+        assert!(f.backend.tools().get("ads_draft_search_campaign").is_some());
+        assert!(
+            f.backend.tools().get("shop_list_orders").is_some(),
+            "shop tools stay"
+        );
+        let shop = f.backend.active_shop_id().unwrap();
+        let saved = f.store.credentials(shop).unwrap();
+        let ads = saved.iter().find(|r| r.kind == "ads:google").unwrap();
+        assert_eq!(ads.credentials["refresh_token"], "1//refresh-secret");
+        assert_eq!(ads.credentials["customer_id"], "1234567890");
+        assert!(f.events().iter().any(|e| matches!(
+            e,
+            BackendEvent::Shops { shops, .. } if shops[0].connectors.contains(&ConnectorKind::GoogleAds)
+        )));
+
+        f.backend.emit(BackendEvent::Error(
+            "echo 1//refresh-secret devtoken-secret".into(),
+        ));
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::Error(e)) if e == "echo [redacted] [redacted]"
+        ));
+
+        f.backend
+            .handle(Command::DisconnectConnector(ConnectorKind::GoogleAds))
+            .await;
+        assert!(f.backend.tools().get("ads_draft_search_campaign").is_none());
+        assert_eq!(f.store.credentials(shop).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn google_app_setup_keeps_saved_secrets_and_never_emits_them() {
+        let mut f = fixture();
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid".into(),
+                client_secret: "".into(),
+                developer_token: "tok".into(),
+            })
+            .await;
+        assert!(matches!(f.events().last(), Some(BackendEvent::Error(_))));
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid".into(),
+                client_secret: "sec".into(),
+                developer_token: "tok".into(),
+            })
+            .await;
+        f.backend
+            .handle(Command::SaveGoogleAdsApp {
+                client_id: "cid2".into(),
+                client_secret: "".into(),
+                developer_token: "".into(),
+            })
+            .await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::GoogleAdsApp { configured: true, client_id }) if client_id == "cid2"
+        ));
+        let app: serde_json::Value =
+            serde_json::from_str(&f.store.app_setting(GOOGLE_APP_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(app["client_secret"], "sec");
     }
 
     #[test]
