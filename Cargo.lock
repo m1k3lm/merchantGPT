@@ -215,6 +215,7 @@ dependencies = [
  "llm",
  "reqwest",
  "serde_json",
+ "skills",
  "store",
  "tokio",
  "tools",
@@ -764,6 +765,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "skills",
  "store",
  "tempfile",
  "thiserror 2.0.21",
@@ -4185,6 +4187,15 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 [[package]]
 name = "skills"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tools",
+]
 
 [[package]]
 name = "skrifa"
@@ -4557,6 +4568,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

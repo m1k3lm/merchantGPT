@@ -59,6 +59,11 @@ pub struct DataSection {
     pub db_path: Option<PathBuf>,
 }
 
+const BUNDLED_SKILLS: &[(&str, &str)] = &[(
+    "daily-sales-summary",
+    include_str!("../../../skills/daily-sales-summary/SKILL.md"),
+)];
+
 pub const TEMPLATE: &str = r#"# merchantGPT configuration. API keys are NOT read from this file: enter them
 # in Settings inside the app; they are stored in the encrypted database.
 
@@ -122,6 +127,20 @@ impl Config {
         std::fs::write(path, TEMPLATE)
     }
 
+    /// Copies the bundled example skills into `dir` the first time, so the
+    /// merchant has a working example to edit.
+    pub fn install_bundled_skills(dir: &Path) -> std::io::Result<()> {
+        if dir.exists() {
+            return Ok(());
+        }
+        for (name, text) in BUNDLED_SKILLS {
+            let skill_dir = dir.join(name);
+            std::fs::create_dir_all(&skill_dir)?;
+            std::fs::write(skill_dir.join("SKILL.md"), text)?;
+        }
+        Ok(())
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data.db_path.clone().unwrap_or_else(|| {
             project_dirs()
@@ -170,6 +189,22 @@ mod tests {
         assert_eq!(c.agent.max_iterations, 3);
         assert_eq!(c.agent.max_tokens, 16_000);
         assert_eq!(c.agent_config().max_iterations, 3);
+    }
+
+    #[test]
+    fn bundled_skills_install_once_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        Config::install_bundled_skills(&skills_dir).unwrap();
+        let (skills, errors) = skills::load_skills(std::slice::from_ref(&skills_dir));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(skills[0].name, "daily-sales-summary");
+        std::fs::remove_dir_all(skills_dir.join("daily-sales-summary")).unwrap();
+        Config::install_bundled_skills(&skills_dir).unwrap();
+        assert!(
+            !skills_dir.join("daily-sales-summary").exists(),
+            "user deletions stick"
+        );
     }
 
     #[test]

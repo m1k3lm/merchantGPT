@@ -9,6 +9,7 @@ use connectors::{
     Connector, ConnectorError, ConnectorKind, ConnectorRegistry, Credentials, HttpTransport,
 };
 use llm::{ChatMessage, LlmError, LlmProvider, ProviderConfig, ProviderId, Usage};
+use skills::{ScriptLimits, Skill};
 use store::Store;
 use tools::{CancellationToken, Tool, ToolContext, ToolRegistry};
 
@@ -67,6 +68,12 @@ pub struct ConversationSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmSettingSummary {
     pub provider: ProviderId,
     pub model: String,
@@ -89,6 +96,8 @@ pub enum BackendEvent {
     },
     /// Saved provider settings, without API keys, to pre-fill the form.
     LlmSettings(Vec<LlmSettingSummary>),
+    /// Skills available as `/name` commands.
+    Skills(Vec<SkillSummary>),
     Shops {
         shops: Vec<ShopSummary>,
         active: Option<i64>,
@@ -127,7 +136,12 @@ pub struct Backend {
     tools: ToolRegistry,
     conversation: Option<i64>,
     history: Vec<ChatMessage>,
+    skills: Arc<Vec<Skill>>,
+    skill_errors: Vec<String>,
 }
+
+/// Notes beyond this many are left out of the system prompt (newest kept).
+const MAX_PROMPT_NOTES: usize = 50;
 
 /// Writes mutation audit entries for the current shop and conversation.
 struct StoreAudit {
@@ -185,7 +199,7 @@ impl Backend {
         transport: Arc<dyn HttpTransport>,
         store: Store,
     ) -> Self {
-        Self {
+        let mut backend = Self {
             sink,
             provider_factory,
             transport,
@@ -196,7 +210,22 @@ impl Backend {
             tools: ToolRegistry::new(),
             conversation: None,
             history: Vec::new(),
-        }
+            skills: Arc::new(Vec::new()),
+            skill_errors: Vec::new(),
+        };
+        backend.rebuild_tools();
+        backend
+    }
+
+    pub fn with_skills(mut self, skills: Vec<Skill>, errors: Vec<String>) -> Self {
+        self.set_skills(skills, errors);
+        self
+    }
+
+    pub fn set_skills(&mut self, skills: Vec<Skill>, errors: Vec<String>) {
+        self.skills = Arc::new(skills);
+        self.skill_errors = errors;
+        self.rebuild_tools();
     }
 
     pub fn with_agent_defaults(mut self, cfg: AgentConfig) -> Self {
@@ -266,6 +295,18 @@ impl Backend {
     }
 
     fn init(&mut self) -> Res<()> {
+        self.emit(BackendEvent::Skills(
+            self.skills
+                .iter()
+                .map(|s| SkillSummary {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                })
+                .collect(),
+        ));
+        for e in &self.skill_errors {
+            self.emit(BackendEvent::Notice(format!("Skill skipped: {e}")));
+        }
         if let Some(row) = self.store.active_llm().map_err(err)? {
             match ProviderId::parse(&row.provider) {
                 Some(provider) => {
@@ -445,7 +486,12 @@ impl Backend {
     }
 
     fn extra_tools(&self) -> Vec<Arc<dyn Tool>> {
-        Vec::new()
+        let mut tools = skills::skill_tools(self.skills.clone(), ScriptLimits::default());
+        tools.extend(crate::memory::memory_tools(
+            self.store.clone(),
+            self.active_shop_id(),
+        ));
+        tools
     }
 
     fn emit_shops(&self) -> Res<()> {
@@ -563,6 +609,11 @@ impl Backend {
     }
 
     fn prompt_context(&self) -> PromptContext {
+        let notes = self
+            .store
+            .memory_notes(self.active_shop_id())
+            .unwrap_or_default();
+        let skip = notes.len().saturating_sub(MAX_PROMPT_NOTES);
         PromptContext {
             today: Some(chrono::Local::now().date_naive()),
             shop_name: self.shop.as_ref().and_then(|s| s.name.clone()),
@@ -573,8 +624,12 @@ impl Backend {
                 .filter_map(|s| s.connector.as_ref())
                 .map(|c| c.kind().display_name())
                 .collect(),
-            skills: Vec::new(),
-            memory: Vec::new(),
+            skills: self
+                .skills
+                .iter()
+                .map(|s| (s.name.clone(), s.description.clone()))
+                .collect(),
+            memory: notes.into_iter().skip(skip).map(|n| n.text).collect(),
         }
     }
 
@@ -594,6 +649,10 @@ impl Backend {
             }
         };
         let first_new = self.history.len();
+        let text = match skills::expand_command(&text, &self.skills) {
+            Some(expanded) => format!("{}\n\n{expanded}", text.trim()),
+            None => text,
+        };
         self.history.push(ChatMessage::user(text));
 
         let usage = Arc::new(Mutex::new(Usage::default()));
@@ -831,7 +890,7 @@ mod tests {
                 && shops[0].kind == Some(ConnectorKind::Shop(Platform::Shopify))
         )));
         assert_eq!(second.backend.history().len(), 2);
-        assert_eq!(second.backend.tools().len(), 8);
+        assert_eq!(second.backend.tools().len(), 8 + 3, "shop + memory tools");
     }
 
     #[tokio::test]
@@ -955,7 +1014,7 @@ mod tests {
         assert_eq!(f.backend.active_shop_id(), Some(a));
         f.backend.handle(Command::RemoveShop(a)).await;
         assert_eq!(f.backend.active_shop_id(), None);
-        assert!(f.backend.tools().is_empty());
+        assert!(f.backend.tools().get("shop_list_orders").is_none());
     }
 
     #[tokio::test]
@@ -975,6 +1034,70 @@ mod tests {
         f.backend.handle(Command::DeleteConversation(id)).await;
         assert_eq!(f.backend.conversation_id(), None);
         assert!(f.backend.history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_notes_appear_in_system_prompt() {
+        let mut f = fixture();
+        f.configure().await;
+        f.connect("a.test", Platform::Shopify).await;
+        f.provider
+            .push_tool_call("m", "memory_save", json!({"text": "Ships on Mondays"}))
+            .push_text("Noted")
+            .push_text("Sure");
+        f.send("remember we ship on Mondays").await;
+        f.send("when do we ship?").await;
+        let last = f.provider.requests().pop().unwrap();
+        let ChatMessage::System { text } = &last.messages[0] else {
+            panic!();
+        };
+        assert!(text.contains("- Ships on Mondays"), "{text}");
+        let audit = f.store.audit_log(f.backend.active_shop_id(), 10).unwrap();
+        assert!(audit
+            .iter()
+            .any(|a| a.tool == "memory_save" && a.stage == "approved"));
+    }
+
+    #[tokio::test]
+    async fn skills_are_listed_and_slash_commands_expand() {
+        let skill = Skill {
+            name: "daily-sales".into(),
+            description: "Morning briefing".into(),
+            body: "Call shop_sales_report for yesterday.".into(),
+            dir: Default::default(),
+            scripts: vec![],
+        };
+        let mut f = fixture();
+        f.backend
+            .set_skills(vec![skill], vec!["bad/SKILL.md: broken".into()]);
+        f.backend.handle(Command::Init).await;
+        assert!(f
+            .events()
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Skills(s) if s[0].name == "daily-sales")));
+        assert!(f
+            .events()
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Notice(n) if n.contains("broken"))));
+        assert!(f.backend.tools().get("load_skill").is_some());
+        assert!(
+            f.backend.tools().get("run_skill_script").is_none(),
+            "no scripts, no runner"
+        );
+
+        f.provider.push_text("Briefing");
+        f.configure().await;
+        f.send("/daily-sales please").await;
+        let req = &f.provider.requests()[0];
+        let ChatMessage::System { text } = &req.messages[0] else {
+            panic!();
+        };
+        assert!(text.contains("- daily-sales: Morning briefing"));
+        let ChatMessage::User { text } = &req.messages[1] else {
+            panic!();
+        };
+        assert!(text.starts_with("/daily-sales please"));
+        assert!(text.contains("Call shop_sales_report for yesterday."));
     }
 
     #[test]

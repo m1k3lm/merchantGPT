@@ -28,6 +28,11 @@ impl Runtime {
             }
             None => Config::default(),
         };
+        let skill_dirs = config.skill_dirs();
+        if let Some(default_dir) = skill_dirs.first() {
+            let _ = Config::install_bundled_skills(default_dir);
+        }
+        let (skills, skill_errors) = skills::load_skills(&skill_dirs);
         let db_path = config.db_path();
         let store = Store::open_with_keystore(&db_path, &KeyringKeyStore::default())
             .map_err(|e| format!("Could not open {}: {e}", db_path.display()))?;
@@ -49,7 +54,8 @@ impl Runtime {
             ctx.request_repaint();
         });
         let mut backend = Backend::new(sink, factory, Arc::new(ReqwestTransport::new(http)), store)
-            .with_agent_defaults(config.agent_config());
+            .with_agent_defaults(config.agent_config())
+            .with_skills(skills, skill_errors.iter().map(|e| e.to_string()).collect());
         rt.spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 backend.handle(cmd).await;

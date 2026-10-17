@@ -314,6 +314,26 @@ impl App {
     fn input_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("input_bar").show(ui, |ui| {
             ui.add_space(6.0);
+            let suggestions: Vec<(String, String)> = self
+                .state
+                .skill_suggestions(&self.input)
+                .into_iter()
+                .map(|s| (s.name.clone(), s.description.clone()))
+                .collect();
+            if !suggestions.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Skills:");
+                    for (name, description) in suggestions {
+                        if ui
+                            .small_button(format!("/{name}"))
+                            .on_hover_text(description)
+                            .clicked()
+                        {
+                            self.input = format!("/{name} ");
+                        }
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 if ui.button("+").on_hover_text("Add a connector").clicked() {
                     self.flow = ConnectorFlow::PickConnector;
@@ -347,7 +367,7 @@ impl App {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if self.state.items.is_empty() {
-                    ui.weak("Connect your shop with the + button and configure an AI provider in Settings, then ask anything about your store.");
+                    ui.weak("Connect your shop with the + button and configure an AI provider in Settings, then ask anything about your store. Type / to run a skill.");
                 }
                 for (idx, item) in self.state.items.iter().enumerate() {
                     render_item(ui, idx, item, &mut answers);

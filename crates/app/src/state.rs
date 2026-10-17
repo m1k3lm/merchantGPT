@@ -3,7 +3,7 @@
 
 use chat_core::{
     AgentEvent, BackendEvent, Command, ConversationSummary, Decision, LlmSettingSummary, Responder,
-    ShopSummary,
+    ShopSummary, SkillSummary,
 };
 use llm::{ChatMessage, ProviderId, Usage};
 use tools::{CancellationToken, Mutability, ToolCall};
@@ -56,6 +56,7 @@ pub struct AppState {
     pub active_shop: Option<i64>,
     pub conversations: Vec<ConversationSummary>,
     pub active_conversation: Option<i64>,
+    pub skills: Vec<SkillSummary>,
 }
 
 pub fn pretty_args(v: &serde_json::Value) -> String {
@@ -177,6 +178,20 @@ impl AppState {
         }
     }
 
+    /// Skills matching a `/prefix` being typed, before the first space.
+    pub fn skill_suggestions(&self, input: &str) -> Vec<&SkillSummary> {
+        let Some(prefix) = input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if prefix.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        self.skills
+            .iter()
+            .filter(|s| s.name.starts_with(prefix))
+            .collect()
+    }
+
     pub fn active_shop(&self) -> Option<&ShopSummary> {
         self.shops.iter().find(|s| Some(s.id) == self.active_shop)
     }
@@ -199,6 +214,7 @@ impl AppState {
             BackendEvent::Error(e) => self.items.push(ChatItem::Error(e)),
             BackendEvent::LlmConfigured { provider, model } => self.llm = Some((provider, model)),
             BackendEvent::LlmSettings(s) => self.llm_settings = s,
+            BackendEvent::Skills(s) => self.skills = s,
             BackendEvent::Shops { shops, active } => {
                 self.shops = shops;
                 self.active_shop = active;
@@ -357,6 +373,25 @@ mod tests {
         s.cancel_turn();
         assert!(token.is_cancelled());
         assert!(matches!(rx.try_recv().unwrap(), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn skill_suggestions_follow_the_slash_prefix() {
+        let mut s = AppState::default();
+        s.apply(BackendEvent::Skills(vec![
+            SkillSummary {
+                name: "daily-sales".into(),
+                description: String::new(),
+            },
+            SkillSummary {
+                name: "restock".into(),
+                description: String::new(),
+            },
+        ]));
+        assert_eq!(s.skill_suggestions("/").len(), 2);
+        assert_eq!(s.skill_suggestions("/da")[0].name, "daily-sales");
+        assert!(s.skill_suggestions("/daily-sales now").is_empty());
+        assert!(s.skill_suggestions("hello").is_empty());
     }
 
     #[test]
