@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::schema::CredentialField as F;
 use crate::shop::ShopConnectorAdapter;
 use crate::stub::StubShop;
+use crate::woocommerce::WooCommerce;
 use crate::{
     Connector, ConnectorError, ConnectorKind, CredentialSchema, Credentials, HttpTransport,
     Platform,
@@ -48,10 +49,13 @@ impl ConnectorRegistry {
                 missing.join(", ")
             )));
         }
-        let _ = (base_url, transport);
-        match kind {
-            ConnectorKind::Shop(p) => Ok(Arc::new(ShopConnectorAdapter(Arc::new(StubShop(p))))),
-        }
+        let shop: Arc<dyn crate::ShopConnector> = match kind {
+            ConnectorKind::Shop(Platform::WooCommerce) => {
+                Arc::new(WooCommerce::new(base_url, credentials, transport))
+            }
+            ConnectorKind::Shop(p) => Arc::new(StubShop(p)),
+        };
+        Ok(Arc::new(ShopConnectorAdapter(shop)))
     }
 }
 

@@ -7,9 +7,56 @@ services:
       - target:/app/target
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: cargo build
+
+  # Local WooCommerce store for manual and live tests (opt-in):
+  #   docker compose --profile woo up -d woo
+  #   docker compose --profile woo run --rm woo-cli bash /scripts/woo-setup.sh
+  woo-db:
+    image: mariadb:11.4
+    profiles: [woo]
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: wp
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp
+    volumes:
+      - woo-db:/var/lib/mysql
+
+  woo:
+    image: wordpress:7-php8.3-apache
+    profiles: [woo]
+    depends_on: [woo-db]
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: woo-db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+    volumes:
+      - woo-html:/var/www/html
+
+  woo-cli:
+    image: wordpress:cli-php8.3
+    profiles: [woo]
+    depends_on: [woo]
+    user: "33:33"
+    environment:
+      WORDPRESS_DB_HOST: woo-db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+      HOME: /tmp
+    volumes:
+      - woo-html:/var/www/html
+      - ./scripts:/scripts:ro
 
 volumes:
   target:
   cargo-registry:
   cargo-git:
+  woo-db:
+  woo-html:

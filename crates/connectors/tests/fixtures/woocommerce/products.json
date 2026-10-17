@@ -1,0 +1,8 @@
+[
+  {"id": 794, "name": "Blue Hoodie", "slug": "blue-hoodie", "type": "simple", "status": "publish",
+   "sku": "HOOD-BLU", "price": "42.00", "regular_price": "42.00", "sale_price": "",
+   "manage_stock": true, "stock_quantity": 7, "stock_status": "instock", "categories": []},
+  {"id": 795, "name": "Gift card", "slug": "gift-card", "type": "simple", "status": "draft",
+   "sku": "", "price": "", "regular_price": "", "sale_price": "",
+   "manage_stock": false, "stock_quantity": null, "stock_status": "instock"}
+]

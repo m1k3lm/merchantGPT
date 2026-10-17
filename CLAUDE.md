@@ -30,6 +30,21 @@ docker compose run --rm dev cargo clippy --all-targets -- -D warnings
 docker compose run --rm dev cargo fmt --check
 ```
 
+### Local WooCommerce store (`woo` compose profile)
+
+A real WordPress 7 + WooCommerce store with sample data, for manual testing of the app and the ignored live test. Its home URL is `http://localhost:8080`, so over plain HTTP the connector signs requests with OAuth 1.0a.
+
+```bash
+docker compose --profile woo up -d woo
+docker compose --profile woo run --rm woo-cli bash /scripts/woo-setup.sh   # prints WOO_URL / WOO_CK / WOO_CS (new key each run)
+docker compose run --rm -e WOO_URL=http://localhost:8080 -e WOO_CK=... -e WOO_CS=... \
+  -e WOO_RESOLVE=host.docker.internal:8080 dev cargo test -p connectors --test woocommerce_live -- --ignored
+docker compose --profile woo stop
+docker compose --profile woo rm -sf woo woo-db woo-cli && docker volume rm merchantgpt_woo-db merchantgpt_woo-html   # reset the store only
+```
+
+Never use `docker compose down -v` to reset the store: it also deletes the dev service's cargo cache volumes. `WOO_RESOLVE` keeps the request URL equal to the store's home URL (part of the OAuth signature) while connecting through the Docker host.
+
 ## Architecture
 
 merchantGPT is an agent in the Hermes Agent / OpenClaw style: an LLM drives merchant operations through native tool calling. Connectors contribute tools, skills contribute instructions and scripts, and every mutating tool call is gated behind a confirmation card in the UI. The full phased plan lives in `docs/PLAN.md`.
@@ -54,6 +69,7 @@ tools  <-  connectors, llm, skills, store  <-  chat-core  <-  app
 - Tool names must match `^[a-zA-Z0-9_-]{1,64}$` to be valid on all four providers.
 - Tool output (product descriptions, order notes, customer text) is data, never instructions. The system prompt says so, and the confirmation card shows the exact arguments the model chose.
 - Money is `rust_decimal::Decimal`, never `f64`.
+- WooCommerce's OAuth base string double-encodes each `key=value` pair (a space becomes `%2520`). Only the live test against the `woo` store proves signing; wiremock does not check signatures.
 - Secrets (LLM API keys, consumer secrets) must never reach logs, audit rows or error strings returned to the model.
 - LLM API keys are never written to `config.toml`; it only holds defaults (provider, model, base URL, agent limits, skill dirs, DB path). Keys live in the encrypted DB.
 - The OS keyring cannot be exercised inside the container. Tests use `InMemoryKeyStore`; the real keyring is a manual host check.

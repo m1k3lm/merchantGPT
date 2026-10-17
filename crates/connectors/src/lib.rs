@@ -9,6 +9,7 @@ pub mod shop;
 pub mod shop_tools;
 pub mod stub;
 pub mod transport;
+pub mod woocommerce;
 
 use std::sync::Arc;
 

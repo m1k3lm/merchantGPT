@@ -1,0 +1,5 @@
+[
+  {"total_sales": "1234.50", "net_sales": "1100.00", "average_sales": "68.75", "total_orders": 17,
+   "total_items": "31", "total_tax": "0.00", "total_shipping": "45.00", "total_refunds": 0,
+   "total_discount": "0.00", "totals_grouped_by": "day", "totals": {}}
+]
