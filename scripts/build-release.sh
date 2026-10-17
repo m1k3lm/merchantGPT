@@ -2,7 +2,9 @@
 # Builds the release binary with the publisher's Google Ads credentials
 # compiled in, so merchants only have to "Sign in with Google".
 # Put the values in release.env (gitignored; see release.env.example) or
-# export them in the environment, e.g. from CI secrets.
+# export them in the environment, e.g. from CI secrets. crates/core/build.rs
+# reads release.env on any cargo build; this script adds the missing-value
+# warnings and picks up a release.env created since the last build.
 #   bash scripts/build-release.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."

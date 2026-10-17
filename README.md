@@ -71,10 +71,10 @@ The publisher's Google credentials are compiled into the release binary, so they
 
 ```bash
 cp release.env.example release.env      # gitignored; fill in the three values
-bash scripts/build-release.sh           # cargo build --release with them compiled in
+bash scripts/build-release.sh           # first time; afterwards plain cargo build --release is enough
 ```
 
-The script also reads the values from the environment, which suits CI secrets. It warns about any value that is missing; that build then asks users for it.
+Every build of the workspace (`cargo build`, `cargo run`, `cargo test`) compiles in the values from `release.env`, and a build with all three values never asks the merchant for them. Cargo starts tracking the file at the first build that finds it, so after creating it run the script once (or `touch crates/core/build.rs`); after that, edits to the file trigger a rebuild. Variables set in the environment override the file, which suits CI secrets. The script also warns about any missing value; that build asks users for it.
 
 Anything compiled into a desktop app can be extracted from the binary. The developer token alone gives no access to anyone's ads account (each call also needs the merchant's own Google sign-in), but it could be misused under the publisher's API quota. A server-side proxy that adds the token would avoid shipping it.
 
