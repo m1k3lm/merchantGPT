@@ -39,6 +39,7 @@ docker compose --profile woo up -d woo
 docker compose --profile woo run --rm woo-cli bash /scripts/woo-setup.sh   # prints WOO_URL / WOO_CK / WOO_CS (new key each run)
 docker compose run --rm -e WOO_URL=http://localhost:8080 -e WOO_CK=... -e WOO_CS=... \
   -e WOO_RESOLVE=host.docker.internal:8080 dev cargo test -p connectors --test woocommerce_live -- --ignored
+# same env, full agent path (scripted model, real store, audit): cargo test -p chat-core --test live_woo_agent -- --ignored
 docker compose --profile woo stop
 docker compose --profile woo rm -sf woo woo-db woo-cli && docker volume rm merchantgpt_woo-db merchantgpt_woo-html   # reset the store only
 ```
