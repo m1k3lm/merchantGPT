@@ -2,8 +2,8 @@
 //! the chat's behaviour is unit-testable without a window.
 
 use chat_core::{
-    AgentEvent, BackendEvent, Command, ConversationSummary, Decision, LlmSettingSummary, Responder,
-    ShopSummary, SkillSummary, TaskSummary,
+    AgentEvent, AuditSummary, BackendEvent, Command, ConversationSummary, Decision,
+    LlmSettingSummary, Responder, ShopSummary, SkillSummary, TaskSummary,
 };
 use llm::{ChatMessage, ProviderId, Usage};
 use tools::{CancellationToken, Mutability, ToolCall};
@@ -58,6 +58,7 @@ pub struct AppState {
     pub active_conversation: Option<i64>,
     pub skills: Vec<SkillSummary>,
     pub tasks: Vec<TaskSummary>,
+    pub audit: Vec<AuditSummary>,
 }
 
 pub fn pretty_args(v: &serde_json::Value) -> String {
@@ -217,6 +218,7 @@ impl AppState {
             BackendEvent::LlmSettings(s) => self.llm_settings = s,
             BackendEvent::Skills(s) => self.skills = s,
             BackendEvent::Tasks(t) => self.tasks = t,
+            BackendEvent::Audit(rows) => self.audit = rows,
             BackendEvent::TaskFinished { name, error } => self.items.push(match error {
                 None => ChatItem::Notice(format!(
                     "Scheduled task \"{name}\" finished; its report is in the \"Task: {name}\" chat."

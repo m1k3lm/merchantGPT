@@ -92,6 +92,7 @@ impl Default for SettingsForm {
 }
 
 struct App {
+    audit_open: bool,
     runtime: Result<Runtime, String>,
     state: AppState,
     input: String,
@@ -103,6 +104,7 @@ struct App {
 impl App {
     fn new(runtime: Result<Runtime, String>) -> Self {
         Self {
+            audit_open: false,
             runtime,
             state: AppState::default(),
             input: String::new(),
@@ -194,6 +196,7 @@ impl eframe::App for App {
         self.input_bar(ui);
         egui::CentralPanel::default().show(ui, |ui| self.transcript(ui));
         self.settings_window(ui.ctx());
+        self.audit_window(ui.ctx());
         self.connector_window(ui.ctx());
         self.dialogs(ui.ctx());
     }
@@ -220,6 +223,19 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.open_settings();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.active_shop.is_some(),
+                            egui::Button::new("Activity"),
+                        )
+                        .on_hover_text(
+                            "Every change the assistant made or tried to make in this shop",
+                        )
+                        .clicked()
+                    {
+                        self.audit_open = true;
+                        self.send(Command::LoadAudit);
                     }
                     let u = self.state.usage;
                     if u.input_tokens + u.output_tokens > 0 {
@@ -512,6 +528,65 @@ impl App {
             open = false;
         }
         self.settings.open = open;
+    }
+
+    fn audit_window(&mut self, ctx: &egui::Context) {
+        if !self.audit_open {
+            return;
+        }
+        let mut open = true;
+        let mut refresh = false;
+        egui::Window::new("Activity log")
+            .open(&mut open)
+            .default_size([760.0, 420.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak("Changes to the shop, approved or denied, newest first.");
+                    if ui.small_button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
+                if self.state.audit.is_empty() {
+                    ui.weak("Nothing yet.");
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("audit")
+                        .striped(true)
+                        .num_columns(5)
+                        .show(ui, |ui| {
+                            ui.strong("When");
+                            ui.strong("Action");
+                            ui.strong("Outcome");
+                            ui.strong("Arguments");
+                            ui.strong("Detail");
+                            ui.end_row();
+                            for row in &self.state.audit {
+                                ui.label(
+                                    row.created_at
+                                        .replace('T', " ")
+                                        .trim_end_matches('Z')
+                                        .to_string(),
+                                );
+                                ui.label(&row.tool);
+                                let color = match row.stage.as_str() {
+                                    "succeeded" => GREEN,
+                                    "failed" | "denied" => RED,
+                                    _ => Color32::GRAY,
+                                };
+                                ui.colored_label(color, &row.stage);
+                                ui.label(RichText::new(&row.arguments).monospace().small());
+                                ui.label(
+                                    RichText::new(row.detail.as_deref().unwrap_or("")).small(),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        if refresh {
+            self.send(Command::LoadAudit);
+        }
+        self.audit_open = open;
     }
 
     fn connector_window(&mut self, ctx: &egui::Context) {

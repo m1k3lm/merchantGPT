@@ -6,12 +6,13 @@ pub mod backend;
 pub mod config;
 pub mod memory;
 pub mod prompt;
+pub mod redact;
 pub mod scheduler;
 
 pub use agent::{AgentConfig, AgentEvent, Decision, Responder};
 pub use backend::{
-    Backend, BackendEvent, Command, ConversationSummary, LlmSettingSummary, ShopSummary,
-    SkillSummary, TaskSummary,
+    AuditSummary, Backend, BackendEvent, Command, ConversationSummary, LlmSettingSummary,
+    ShopSummary, SkillSummary, TaskSummary,
 };
 pub use config::Config;
 pub use connectors::Credentials;

@@ -19,6 +19,7 @@ use crate::agent::{
     Agent, AgentConfig, AgentEvent, AuditEntry, AuditSink, AuditStage, AutoDeny, UiGate,
 };
 use crate::prompt::{system_prompt, PromptContext};
+use crate::redact::Redactor;
 use crate::scheduler::Schedule;
 
 #[derive(Debug)]
@@ -57,6 +58,17 @@ pub enum Command {
     },
     DeleteTask(i64),
     RunTaskNow(i64),
+    /// Loads the active shop's audit log (newest first).
+    LoadAudit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSummary {
+    pub created_at: String,
+    pub tool: String,
+    pub arguments: String,
+    pub stage: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +144,7 @@ pub enum BackendEvent {
         name: String,
         error: Option<String>,
     },
+    Audit(Vec<AuditSummary>),
     Shops {
         shops: Vec<ShopSummary>,
         active: Option<i64>,
@@ -283,8 +296,49 @@ impl Backend {
         self.conversation
     }
 
+    /// Every event leaves through here, so error text is scrubbed of secrets.
     fn emit(&self, e: BackendEvent) {
+        let e = match e {
+            BackendEvent::Error(m) => BackendEvent::Error(self.redactor().apply(&m)),
+            BackendEvent::TurnEnded { error } => BackendEvent::TurnEnded {
+                error: error.map(|m| self.redactor().apply(&m)),
+            },
+            BackendEvent::TaskFinished { name, error } => BackendEvent::TaskFinished {
+                name,
+                error: error.map(|m| self.redactor().apply(&m)),
+            },
+            other => other,
+        };
         (self.sink)(e)
+    }
+
+    /// The LLM key plus every secret credential field of every saved shop.
+    fn redactor(&self) -> Redactor {
+        let mut secrets: Vec<String> = self
+            .llm
+            .iter()
+            .map(|(cfg, _)| cfg.api_key.clone())
+            .collect();
+        secrets.extend(
+            self.store
+                .llm_settings()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.api_key),
+        );
+        for shop in self.store.list_shops().unwrap_or_default() {
+            for row in self.store.credentials(shop.id).unwrap_or_default() {
+                let Some(kind) = ConnectorKind::parse(&row.kind) else {
+                    continue;
+                };
+                for field in ConnectorRegistry::credential_schema(kind).fields() {
+                    if field.secret {
+                        secrets.extend(row.credentials.get(field.key).cloned());
+                    }
+                }
+            }
+        }
+        Redactor::new(secrets)
     }
 
     pub async fn handle(&mut self, cmd: Command) {
@@ -342,6 +396,7 @@ impl Backend {
                 .delete_task(id)
                 .map_err(err)
                 .and_then(|_| self.emit_tasks()),
+            Command::LoadAudit => self.load_audit(),
             Command::RunTaskNow(id) => {
                 match self
                     .store
@@ -776,6 +831,7 @@ impl Backend {
             audit: &audit,
             sink: agent_sink,
             config: &config,
+            redactor: self.redactor(),
         };
         let outcome = agent.run_turn(&prompt, &mut self.history, &ctx).await;
 
@@ -832,6 +888,26 @@ impl Backend {
                     schedule: t.schedule,
                     enabled: t.enabled,
                     last_run_at: t.last_run_at,
+                })
+                .collect(),
+        ));
+        Ok(())
+    }
+
+    fn load_audit(&self) -> Res<()> {
+        let Some(shop) = self.active_shop_id() else {
+            self.emit(BackendEvent::Audit(Vec::new()));
+            return Ok(());
+        };
+        let rows = self.store.audit_log(Some(shop), 200).map_err(err)?;
+        self.emit(BackendEvent::Audit(
+            rows.into_iter()
+                .map(|r| AuditSummary {
+                    created_at: r.created_at,
+                    tool: r.tool,
+                    arguments: r.arguments,
+                    stage: r.stage,
+                    detail: r.detail,
                 })
                 .collect(),
         ));
@@ -963,6 +1039,7 @@ impl Backend {
             audit: &audit,
             sink,
             config: &config,
+            redactor: self.redactor(),
         };
         let outcome = agent.run_turn(&prompt, &mut history, &ctx).await;
         let serialized: Vec<String> = history
@@ -1480,6 +1557,52 @@ mod tests {
             matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("unknown schedule"))
         );
         assert!(f.store.list_tasks(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn error_events_never_contain_saved_secrets() {
+        let mut f = fixture();
+        f.configure().await;
+        f.backend
+            .handle(Command::ConnectShop {
+                url: "a.test".into(),
+                kind: ConnectorKind::Shop(Platform::Shopify),
+                credentials: Credentials::from([(
+                    "access_token".into(),
+                    "shpat_supersecret".into(),
+                )]),
+            })
+            .await;
+        f.backend.handle(Command::OpenConversation(9999)).await;
+        f.backend.emit(BackendEvent::Error(
+            "upstream said: token shpat_supersecret and key k".into(),
+        ));
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::Error(e)) if e == "upstream said: token [redacted] and key k"
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_log_is_listed_for_the_active_shop() {
+        let mut f = fixture();
+        f.configure().await;
+        f.connect("shop.test", Platform::Magento).await;
+        f.provider
+            .push_tool_call(
+                "c1",
+                "shop_update_order_status",
+                json!({"id": "1", "status": "completed"}),
+            )
+            .push_text("done");
+        f.send("complete order 1").await;
+        f.backend.handle(Command::LoadAudit).await;
+        let Some(BackendEvent::Audit(rows)) = f.events().last().cloned() else {
+            panic!("{:?}", f.events().last());
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stage, "failed", "newest first");
+        assert_eq!(rows[1].tool, "shop_update_order_status");
     }
 
     #[test]

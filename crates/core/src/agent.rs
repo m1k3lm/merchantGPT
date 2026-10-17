@@ -14,6 +14,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tools::{Mutability, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolResult};
 
+use crate::redact::Redactor;
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
@@ -198,6 +200,7 @@ pub struct Agent<'a> {
     pub audit: &'a dyn AuditSink,
     pub sink: EventSink,
     pub config: &'a AgentConfig,
+    pub redactor: Redactor,
 }
 
 const FORCED_ANSWER_NOTE: &str = "\n\nThe tool budget for this turn is exhausted. Answer the merchant now with what you already know, and say what is still missing.";
@@ -461,7 +464,10 @@ impl Agent<'_> {
         };
         let result = match outcome {
             Ok(content) => {
-                let content = truncate(content, self.config.max_tool_result_chars);
+                let content = truncate(
+                    self.redactor.apply(&content),
+                    self.config.max_tool_result_chars,
+                );
                 if mutating {
                     self.audit(call, AuditStage::Succeeded(truncate(content.clone(), 500)));
                 }
@@ -471,7 +477,7 @@ impl Agent<'_> {
                 if mutating {
                     self.audit(call, AuditStage::Failed(e.to_string()));
                 }
-                ToolResult::error(&call.id, e.to_string())
+                ToolResult::error(&call.id, self.redactor.apply(&e.to_string()))
             }
         };
         (self.sink)(AgentEvent::ToolFinished {
@@ -482,6 +488,13 @@ impl Agent<'_> {
     }
 
     fn audit(&self, call: &ToolCall, stage: AuditStage) {
+        let r = &self.redactor;
+        let stage = match stage {
+            AuditStage::Denied(reason) => AuditStage::Denied(reason.map(|x| r.apply(&x))),
+            AuditStage::Approved => AuditStage::Approved,
+            AuditStage::Succeeded(x) => AuditStage::Succeeded(r.apply(&x)),
+            AuditStage::Failed(x) => AuditStage::Failed(r.apply(&x)),
+        };
         self.audit.record(AuditEntry {
             tool: call.name.clone(),
             arguments: call.arguments.clone(),
@@ -596,6 +609,7 @@ mod tests {
                 audit: self.rec.as_ref(),
                 sink: Arc::new(move |e| rec.events.lock().unwrap().push(e)),
                 config: &self.config,
+                redactor: Redactor::new(["s3cr3t-value".to_string()]),
             };
             agent.run_turn("SYSTEM", history, ctx).await
         }
@@ -909,6 +923,45 @@ mod tests {
         };
         assert_eq!(p.provider, llm::ProviderId::OpenAi);
         assert_eq!(p.content[0]["signature"], "s");
+    }
+
+    struct Leaky;
+
+    #[async_trait]
+    impl Tool for Leaky {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "leaky_change".into(),
+                description: "d".into(),
+                parameters: json!({"type": "object"}),
+                mutability: Mutability::Mutate,
+            }
+        }
+        async fn call(&self, _: Value, _: &ToolContext) -> Result<String, ToolError> {
+            Err(ToolError::Failed("401: key s3cr3t-value rejected".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_from_tool_results_and_audit() {
+        let mut h = Harness::new();
+        h.tools.register(Arc::new(Leaky));
+        h.provider
+            .push_tool_call("c", "leaky_change", json!({}))
+            .push_text("ok");
+        let mut history = user("go");
+        h.run(&AlwaysApprove, &mut history, &ToolContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_results(&history)[0].content,
+            "401: key [redacted] rejected"
+        );
+        let audit = h.rec.audit.lock().unwrap();
+        assert_eq!(
+            audit[1].stage,
+            AuditStage::Failed("401: key [redacted] rejected".into())
+        );
     }
 
     #[test]
