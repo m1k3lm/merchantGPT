@@ -78,7 +78,7 @@ pub fn sse_events<S, B, E>(bytes: S) -> impl Stream<Item = Result<SseEvent, LlmE
 where
     S: Stream<Item = Result<B, E>> + Send + Unpin + 'static,
     B: AsRef<[u8]>,
-    E: std::fmt::Display,
+    E: std::error::Error,
 {
     struct State<S> {
         bytes: S,
@@ -105,7 +105,13 @@ where
                     Some(Ok(chunk)) => st.pending.extend(st.parser.feed(chunk.as_ref())),
                     Some(Err(e)) => {
                         st.done = true;
-                        return Some((Err(LlmError::Transport(e.to_string())), st));
+                        let mut msg = e.to_string();
+                        let mut source = e.source();
+                        while let Some(s) = source {
+                            msg.push_str(&format!(": {s}"));
+                            source = s.source();
+                        }
+                        return Some((Err(LlmError::Transport(msg)), st));
                     }
                     None => {
                         st.done = true;
@@ -215,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_events_adapts_a_byte_stream() {
-        let chunks: Vec<Result<&'static [u8], String>> =
+        let chunks: Vec<Result<&'static [u8], std::io::Error>> =
             vec![Ok(b"data: 1\n\nda"), Ok(b"ta: 2\n\n"), Ok(b"data: 3")];
         let evs: Vec<_> = sse_events(futures::stream::iter(chunks))
             .map(|e| e.unwrap().data)

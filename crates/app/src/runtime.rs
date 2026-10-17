@@ -44,7 +44,10 @@ impl Runtime {
         let (cmd_tx, mut cmd_rx) = tmpsc::unbounded_channel::<Command>();
         let (ev_tx, ev_rx) = mpsc::channel::<BackendEvent>();
 
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .user_agent(connectors::transport::USER_AGENT)
+            .build()
+            .map_err(|e| e.to_string())?;
         let factory: ProviderFactory = {
             let http = http.clone();
             Arc::new(move |cfg| llm::build_provider(cfg, http.clone()))

@@ -131,7 +131,7 @@ pub enum LlmError {
     RateLimited(String),
     #[error("provider error {status}: {message}")]
     Http { status: u16, message: String },
-    #[error("transport error: {0}")]
+    #[error("could not reach the AI provider: {0}")]
     Transport(String),
     #[error("could not decode provider response: {0}")]
     Decode(String),

@@ -15,6 +15,7 @@ async fn bearer_token_and_search_criteria_reach_magento() {
     Mock::given(method("GET"))
         .and(path("/rest/V1/orders"))
         .and(header("authorization", "Bearer integration-token"))
+        .and(header("user-agent", connectors::transport::USER_AGENT))
         .and(query_param(
             "searchCriteria[filter_groups][0][filters][0][field]",
             "status",
@@ -33,11 +34,7 @@ async fn bearer_token_and_search_criteria_reach_magento() {
         .await;
 
     let creds = Credentials::from([("access_token".into(), "integration-token".into())]);
-    let magento = Magento::new(
-        &server.uri(),
-        &creds,
-        Arc::new(ReqwestTransport::new(reqwest::Client::new())),
-    );
+    let magento = Magento::new(&server.uri(), &creds, Arc::new(ReqwestTransport::default()));
     let page = magento
         .list_orders(&OrderQuery {
             status: Some("processing".into()),

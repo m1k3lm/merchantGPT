@@ -17,15 +17,34 @@ pub(crate) async fn send_with_retry(
         let result = build().send().await;
         let retry = match &result {
             Ok(r) => matches!(r.status().as_u16(), 429 | 500 | 502 | 503 | 504 | 529),
-            Err(e) => e.is_connect() || e.is_timeout(),
+            // Nothing has streamed yet, so resending after a failed send
+            // (e.g. a pooled connection the server closed) is safe.
+            Err(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         };
         if !retry || attempt >= MAX_RETRIES {
-            let resp = result.map_err(|e| LlmError::Transport(e.without_url().to_string()))?;
+            let resp = result.map_err(|e| LlmError::Transport(describe(e)))?;
             return check_status(resp).await;
         }
         tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
         attempt += 1;
     }
+}
+
+/// The error with every underlying cause; `reqwest` alone prints only "error
+/// sending request". The URL is dropped since it may carry an API key.
+pub(crate) fn describe(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        let text = s.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = s.source();
+    }
+    msg
 }
 
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, LlmError> {
@@ -62,6 +81,21 @@ fn error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_provider_names_the_cause() {
+        let client = reqwest::Client::new();
+        let err = send_with_retry(|| client.post("http://127.0.0.1:1/v1/messages?key=secret"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("could not reach the AI provider: "),
+            "{err}"
+        );
+        assert!(err.to_lowercase().contains("refused"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+    }
 
     #[test]
     fn error_message_handles_provider_shapes() {

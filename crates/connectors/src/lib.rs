@@ -74,7 +74,7 @@ pub enum ConnectorError {
     Api { status: u16, message: String },
     #[error("unexpected response: {0}")]
     InvalidResponse(String),
-    #[error("transport error: {0}")]
+    #[error("could not reach the shop: {0}")]
     Transport(String),
 }
 

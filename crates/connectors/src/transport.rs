@@ -105,6 +105,27 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
         .map(|(_, v)| v.as_str())
 }
 
+pub const USER_AGENT: &str = concat!("merchantGPT/", env!("CARGO_PKG_VERSION"));
+
+/// The error and every underlying cause ("connection refused", "certificate
+/// not trusted", "operation timed out"...). `reqwest` only prints the top
+/// level, which is just "error sending request". The URL is dropped because
+/// it can carry credentials in the query string.
+pub fn describe(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        let text = s.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = s.source();
+    }
+    msg
+}
+
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     /// Returns any HTTP status as a response; only network-level failures are errors.
@@ -142,7 +163,8 @@ impl ReqwestTransport {
         let mut builder = self
             .client
             .request(method, &req.url)
-            .timeout(Duration::from_secs(30));
+            // Magento order pages can take tens of seconds on large stores.
+            .timeout(Duration::from_secs(60));
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
@@ -176,7 +198,12 @@ impl ReqwestTransport {
 
 impl Default for ReqwestTransport {
     fn default() -> Self {
-        Self::new(reqwest::Client::new())
+        Self::new(
+            reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .expect("static client configuration"),
+        )
     }
 }
 
@@ -189,11 +216,13 @@ impl HttpTransport for ReqwestTransport {
             let result = self.send_once(&req).await;
             let transient = match &result {
                 Ok(r) => matches!(r.status, 429 | 502 | 503 | 504),
-                Err(e) => e.is_connect() || e.is_timeout(),
+                // `is_request` covers a pooled connection the server already
+                // closed: nothing was processed, so a resend is safe here.
+                Err(e) => e.is_connect() || e.is_timeout() || e.is_request(),
             };
             if !(retryable && transient && attempt < self.max_retries) {
                 // Without_url keeps query-string credentials out of error text.
-                return result.map_err(|e| ConnectorError::Transport(e.without_url().to_string()));
+                return result.map_err(|e| ConnectorError::Transport(describe(e)));
             }
             let retry_after = result.as_ref().ok().and_then(|r| r.header("retry-after"));
             tokio::time::sleep(self.backoff(attempt, retry_after)).await;
@@ -276,6 +305,60 @@ mod tests {
             t.requests()[0].query_pairs(),
             vec![("q".into(), "1".into())]
         );
+    }
+
+    /// Accepts connections and drops them at once, like a server closing a
+    /// pooled connection. Returns the address and the accept counter.
+    fn closing_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                c.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}/rest/V1/orders?token=secret"), count)
+    }
+
+    #[tokio::test]
+    async fn failed_sends_explain_the_cause_without_the_url_and_only_reads_retry() {
+        use std::sync::atomic::Ordering;
+        let t = ReqwestTransport::default().with_backoff(Duration::from_millis(1), 2);
+
+        let (url, count) = closing_server();
+        let err = t
+            .send(HttpRequest::new(Method::Get, &url))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("could not reach the shop: "), "{msg}");
+        assert!(
+            msg.len() > "could not reach the shop: error sending request".len(),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("secret") && !msg.contains("127.0.0.1"),
+            "{msg}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 3, "GET is retried twice");
+
+        let (url, count) = closing_server();
+        t.send(HttpRequest::new(Method::Post, &url))
+            .await
+            .unwrap_err();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "POST is never resent");
+
+        let refused = t
+            .send(HttpRequest::new(Method::Get, "http://127.0.0.1:1/x"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .to_lowercase();
+        assert!(refused.contains("refused"), "{refused}");
     }
 
     #[test]
