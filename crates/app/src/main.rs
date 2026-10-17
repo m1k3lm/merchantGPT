@@ -1,13 +1,14 @@
 //! Native desktop shell. Rendering only: behaviour lives in `state::AppState`
 //! and the backend in `chat-core`.
 
+mod markdown;
 mod runtime;
 mod state;
 
 use chat_core::{Command, Credentials};
 use connectors::{ConnectorKind, ConnectorRegistry, Platform};
 use eframe::egui::{self, Color32, RichText};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark::CommonMarkCache;
 use llm::{ProviderConfig, ProviderId};
 use runtime::Runtime;
 use state::{pretty_args, AppState, CardState, ChatItem, ToolStatus};
@@ -984,7 +985,7 @@ fn render_item(
 /// own id so tables and code blocks of different messages do not collide.
 fn render_markdown(ui: &mut egui::Ui, idx: usize, text: &str, cache: &mut CommonMarkCache) {
     let id = ui.scope_id().with(("assistant_md", idx));
-    CommonMarkViewer::new().show_with_id(id, ui, cache, text);
+    markdown::render(ui, id, text, cache);
 }
 
 #[cfg(test)]

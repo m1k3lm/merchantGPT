@@ -214,6 +214,7 @@ dependencies = [
  "eframe",
  "egui_commonmark",
  "llm",
+ "pulldown-cmark",
  "reqwest",
  "serde_json",
  "skills",
