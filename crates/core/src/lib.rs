@@ -3,8 +3,12 @@
 
 pub mod agent;
 pub mod backend;
+pub mod config;
 pub mod prompt;
 
 pub use agent::{AgentConfig, AgentEvent, Decision, Responder};
-pub use backend::{Backend, BackendEvent, Command};
+pub use backend::{
+    Backend, BackendEvent, Command, ConversationSummary, LlmSettingSummary, ShopSummary,
+};
+pub use config::Config;
 pub use connectors::Credentials;

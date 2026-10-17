@@ -13,6 +13,7 @@ connectors.workspace = true
 chat-core.workspace = true
 llm.workspace = true
 tools.workspace = true
+store.workspace = true
 eframe = "0.37.0"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "macros"] }
 reqwest = "0.13.5"

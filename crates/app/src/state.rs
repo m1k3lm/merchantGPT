@@ -1,9 +1,11 @@
 //! Headless UI state. Every backend event goes through `AppState::apply`, so
 //! the chat's behaviour is unit-testable without a window.
 
-use chat_core::{AgentEvent, BackendEvent, Command, Decision, Responder};
-use connectors::ConnectorKind;
-use llm::{ProviderId, Usage};
+use chat_core::{
+    AgentEvent, BackendEvent, Command, ConversationSummary, Decision, LlmSettingSummary, Responder,
+    ShopSummary,
+};
+use llm::{ChatMessage, ProviderId, Usage};
 use tools::{CancellationToken, Mutability, ToolCall};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +30,8 @@ pub enum ChatItem {
         call_id: String,
         name: String,
         arguments: String,
-        mutability: Mutability,
+        /// Unknown for calls restored from history.
+        mutability: Option<Mutability>,
         status: ToolStatus,
     },
     Confirmation {
@@ -47,8 +50,12 @@ pub struct AppState {
     pub busy: bool,
     pub cancel: Option<CancellationToken>,
     pub usage: Usage,
-    pub shop: Option<(String, ConnectorKind)>,
     pub llm: Option<(ProviderId, String)>,
+    pub llm_settings: Vec<LlmSettingSummary>,
+    pub shops: Vec<ShopSummary>,
+    pub active_shop: Option<i64>,
+    pub conversations: Vec<ConversationSummary>,
+    pub active_conversation: Option<i64>,
 }
 
 pub fn pretty_args(v: &serde_json::Value) -> String {
@@ -60,6 +67,58 @@ fn preview(s: &str) -> String {
     match s.char_indices().nth(MAX) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),
+    }
+}
+
+fn status_of(content: &str, is_error: bool) -> ToolStatus {
+    if is_error {
+        ToolStatus::Failed(preview(content))
+    } else {
+        ToolStatus::Ok(preview(content))
+    }
+}
+
+/// Rebuilds the transcript of a saved conversation. Confirmation cards are
+/// not restored; their calls show up as tool entries with their outcome.
+pub fn items_from_history(messages: &[ChatMessage]) -> Vec<ChatItem> {
+    let mut items = Vec::new();
+    for m in messages {
+        match m {
+            ChatMessage::System { .. } => {}
+            ChatMessage::User { text } => items.push(ChatItem::User(text.clone())),
+            ChatMessage::Assistant { text, tool_calls } => {
+                if !text.is_empty() {
+                    items.push(ChatItem::Assistant(text.clone()));
+                }
+                for c in tool_calls {
+                    items.push(ChatItem::Tool {
+                        call_id: c.id.clone(),
+                        name: c.name.clone(),
+                        arguments: pretty_args(&c.arguments),
+                        mutability: None,
+                        status: ToolStatus::Running,
+                    });
+                }
+            }
+            ChatMessage::ToolResults { results } => {
+                for r in results {
+                    set_tool_status(&mut items, &r.call_id, status_of(&r.content, r.is_error));
+                }
+            }
+        }
+    }
+    items
+}
+
+fn set_tool_status(items: &mut [ChatItem], id: &str, new_status: ToolStatus) {
+    let found = items.iter_mut().rev().find_map(|i| match i {
+        ChatItem::Tool {
+            call_id, status, ..
+        } if call_id == id => Some(status),
+        _ => None,
+    });
+    if let Some(status) = found {
+        *status = new_status;
     }
 }
 
@@ -116,6 +175,14 @@ impl AppState {
         }
     }
 
+    pub fn active_shop(&self) -> Option<&ShopSummary> {
+        self.shops.iter().find(|s| Some(s.id) == self.active_shop)
+    }
+
+    pub fn saved_llm(&self, provider: ProviderId) -> Option<&LlmSettingSummary> {
+        self.llm_settings.iter().find(|s| s.provider == provider)
+    }
+
     pub fn apply(&mut self, ev: BackendEvent) {
         match ev {
             BackendEvent::Agent(a) => self.apply_agent(a),
@@ -128,19 +195,32 @@ impl AppState {
             }
             BackendEvent::Notice(n) => self.items.push(ChatItem::Notice(n)),
             BackendEvent::Error(e) => self.items.push(ChatItem::Error(e)),
-            BackendEvent::ShopConnected { url, kind } => {
-                self.items.push(ChatItem::Notice(format!(
-                    "Connected {} at {url}.",
-                    kind.display_name()
-                )));
-                self.shop = Some((url, kind));
+            BackendEvent::LlmConfigured { provider, model } => self.llm = Some((provider, model)),
+            BackendEvent::LlmSettings(s) => self.llm_settings = s,
+            BackendEvent::Shops { shops, active } => {
+                self.shops = shops;
+                self.active_shop = active;
             }
-            BackendEvent::LlmConfigured { provider, model } => {
-                self.llm = Some((provider, model));
+            BackendEvent::Conversations { items, active } => {
+                self.conversations = items;
+                self.active_conversation = active;
             }
-            BackendEvent::ConversationReset => {
-                self.items.clear();
-                self.usage = Usage::default();
+            BackendEvent::ConversationOpened {
+                id,
+                messages,
+                usage,
+            } => {
+                // Notices emitted just before (e.g. "Connected …") stay visible.
+                let notices: Vec<_> = self
+                    .items
+                    .drain(..)
+                    .rev()
+                    .take_while(|i| matches!(i, ChatItem::Notice(_) | ChatItem::Error(_)))
+                    .collect();
+                self.items = items_from_history(&messages);
+                self.items.extend(notices.into_iter().rev());
+                self.active_conversation = id;
+                self.usage = usage;
             }
         }
     }
@@ -165,25 +245,16 @@ impl AppState {
                 call_id: call.id,
                 name: call.name,
                 arguments: pretty_args(&call.arguments),
-                mutability,
+                mutability: Some(mutability),
                 status: ToolStatus::Running,
             }),
             AgentEvent::ToolFinished { result, .. } => {
-                let running = self.items.iter_mut().rev().find_map(|i| match i {
-                    ChatItem::Tool {
-                        call_id, status, ..
-                    } if *call_id == result.call_id => Some(status),
-                    _ => None,
-                });
-                let new_status = if result.is_error {
-                    ToolStatus::Failed(preview(&result.content))
-                } else {
-                    ToolStatus::Ok(preview(&result.content))
-                };
-                // Denied mutations never started, so they have no running chip.
-                if let Some(status) = running {
-                    *status = new_status;
-                }
+                // Denied mutations never started, so they have no running entry.
+                set_tool_status(
+                    &mut self.items,
+                    &result.call_id,
+                    status_of(&result.content, result.is_error),
+                );
             }
             AgentEvent::Usage(u) => {
                 self.usage.input_tokens += u.input_tokens;
@@ -204,6 +275,14 @@ mod tests {
         BackendEvent::Agent(AgentEvent::TextDelta(s.into()))
     }
 
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+        }
+    }
+
     #[test]
     fn app_state_appends_deltas_to_in_progress_message() {
         let mut s = AppState::default();
@@ -212,11 +291,7 @@ mod tests {
         s.apply(delta("Hel"));
         s.apply(delta("lo"));
         s.apply(BackendEvent::Agent(AgentEvent::ToolStarted {
-            call: ToolCall {
-                id: "c".into(),
-                name: "shop_list_orders".into(),
-                arguments: json!({}),
-            },
+            call: call("c", "shop_list_orders"),
             mutability: Mutability::Read,
         }));
         s.apply(BackendEvent::Agent(AgentEvent::ToolFinished {
@@ -273,11 +348,7 @@ mod tests {
         let token = s.cancel.clone().unwrap();
         let (responder, mut rx) = Responder::new();
         s.apply(BackendEvent::Agent(AgentEvent::ConfirmationRequested {
-            call: ToolCall {
-                id: "c".into(),
-                name: "x".into(),
-                arguments: json!({}),
-            },
+            call: call("c", "x"),
             description: String::new(),
             responder,
         }));
@@ -295,5 +366,37 @@ mod tests {
         });
         assert!(!s.busy);
         assert!(matches!(s.items.last(), Some(ChatItem::Error(e)) if e == "boom"));
+    }
+
+    #[test]
+    fn opened_conversation_rebuilds_transcript_and_keeps_trailing_notices() {
+        let mut s = AppState::default();
+        s.items.push(ChatItem::User("old".into()));
+        s.items.push(ChatItem::Notice("Connected".into()));
+        s.apply(BackendEvent::ConversationOpened {
+            id: Some(3),
+            messages: vec![
+                ChatMessage::user("orders?"),
+                ChatMessage::Assistant {
+                    text: "Checking".into(),
+                    tool_calls: vec![call("a", "shop_list_orders")],
+                },
+                ChatMessage::ToolResults {
+                    results: vec![ToolResult::error("a", "nope")],
+                },
+                ChatMessage::assistant("Failed"),
+            ],
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+            },
+        });
+        assert_eq!(s.items.len(), 5);
+        assert!(
+            matches!(&s.items[2], ChatItem::Tool { status: ToolStatus::Failed(e), .. } if e == "nope")
+        );
+        assert!(matches!(&s.items[4], ChatItem::Notice(n) if n == "Connected"));
+        assert_eq!(s.active_conversation, Some(3));
+        assert_eq!(s.usage.input_tokens, 5);
     }
 }
