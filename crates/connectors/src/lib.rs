@@ -1,109 +1,98 @@
-//! Platform-agnostic connector trait, credential schemas and shared domain types.
-//! One implementation per e-commerce platform lives in a submodule.
+//! Connectors to external services. A connector contributes tools to the agent;
+//! shop platforms are one kind, ad platforms and carriers are future kinds.
 
 pub mod domain;
+pub mod platform;
+pub mod registry;
 pub mod schema;
+pub mod shop;
+pub mod shop_tools;
+pub mod stub;
+pub mod transport;
 
-use schema::CredentialSchema;
+use std::sync::Arc;
 
-/// Supported e-commerce platforms. Adding a platform means adding a variant
-/// here and a connector implementation; the UI derives everything else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Platform {
-    WooCommerce,
-    Magento,
-    PrestaShop,
-    Shopify,
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tools::Tool;
+
+pub use platform::Platform;
+pub use registry::ConnectorRegistry;
+pub use schema::{CredentialField, CredentialSchema, Credentials};
+pub use shop::ShopConnector;
+pub use transport::{HttpTransport, ReqwestTransport};
+
+/// What a connector connects to. Stored as its `id()` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorKind {
+    Shop(Platform),
 }
 
-impl Platform {
-    pub const ALL: [Platform; 4] = [
-        Platform::WooCommerce,
-        Platform::Magento,
-        Platform::PrestaShop,
-        Platform::Shopify,
-    ];
-
-    pub fn display_name(self) -> &'static str {
+impl ConnectorKind {
+    pub fn id(self) -> String {
         match self {
-            Platform::WooCommerce => "WooCommerce",
-            Platform::Magento => "Magento",
-            Platform::PrestaShop => "PrestaShop",
-            Platform::Shopify => "Shopify",
+            ConnectorKind::Shop(p) => format!("shop:{}", p.id()),
         }
     }
 
-    /// The credentials this platform's API needs. The UI renders the
-    /// credential form from this, so connectors never touch UI code.
-    pub fn credential_schema(self) -> CredentialSchema {
-        use schema::CredentialField as F;
+    pub fn parse(id: &str) -> Option<Self> {
+        let (family, rest) = id.split_once(':')?;
+        match family {
+            "shop" => Platform::parse(rest).map(ConnectorKind::Shop),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(self) -> String {
         match self {
-            Platform::WooCommerce => CredentialSchema::new(vec![
-                F::text("consumer_key", "Consumer key"),
-                F::secret("consumer_secret", "Consumer secret"),
-            ]),
-            Platform::Magento => {
-                CredentialSchema::new(vec![F::secret("access_token", "Integration access token")])
-            }
-            Platform::PrestaShop => {
-                CredentialSchema::new(vec![F::secret("webservice_key", "Webservice key")])
-            }
-            Platform::Shopify => {
-                CredentialSchema::new(vec![F::secret("access_token", "Admin API access token")])
-            }
+            ConnectorKind::Shop(p) => format!("{} shop", p.display_name()),
         }
     }
 }
 
-/// Operations every shop connector must support. Each method maps to the
-/// platform's own API and returns normalised domain types.
-pub trait ShopConnector {
-    fn platform(&self) -> Platform;
-    fn list_products(&self) -> Result<Vec<domain::Product>, ConnectorError>;
-    fn list_orders(&self) -> Result<Vec<domain::Order>, ConnectorError>;
-    fn list_customers(&self) -> Result<Vec<domain::Customer>, ConnectorError>;
+#[async_trait]
+pub trait Connector: Send + Sync {
+    fn kind(&self) -> ConnectorKind;
+    /// Cheap authenticated call proving the credentials work.
+    async fn verify(&self) -> Result<(), ConnectorError>;
+    fn tools(&self) -> Vec<Arc<dyn Tool>>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectorError {
-    NotImplemented(Platform),
-    Transport(String),
+    #[error("{0} is not implemented yet")]
+    NotImplemented(String),
+    #[error("invalid credentials: {0}")]
+    InvalidCredentials(String),
+    #[error("authentication failed: {0}")]
     Auth(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("API error {status}: {message}")]
+    Api { status: u16, message: String },
+    #[error("unexpected response: {0}")]
+    InvalidResponse(String),
+    #[error("transport error: {0}")]
+    Transport(String),
 }
 
-impl std::fmt::Display for ConnectorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectorError::NotImplemented(p) => {
-                write!(f, "{} connector is not implemented yet", p.display_name())
-            }
-            ConnectorError::Transport(m) => write!(f, "transport error: {m}"),
-            ConnectorError::Auth(m) => write!(f, "authentication error: {m}"),
-        }
+impl From<ConnectorError> for tools::ToolError {
+    fn from(e: ConnectorError) -> Self {
+        tools::ToolError::Failed(e.to_string())
     }
 }
-
-impl std::error::Error for ConnectorError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn every_platform_has_a_non_empty_credential_schema() {
+    fn connector_kind_id_roundtrips() {
         for p in Platform::ALL {
-            assert!(!p.credential_schema().fields().is_empty(), "{p:?}");
+            let k = ConnectorKind::Shop(p);
+            assert_eq!(ConnectorKind::parse(&k.id()), Some(k));
         }
-    }
-
-    #[test]
-    fn secrets_are_marked_as_such() {
-        let schema = Platform::WooCommerce.credential_schema();
-        let secret = schema
-            .fields()
-            .iter()
-            .find(|f| f.key == "consumer_secret")
-            .unwrap();
-        assert!(secret.secret);
+        assert_eq!(ConnectorKind::parse("ads:google"), None);
+        assert_eq!(ConnectorKind::parse("nonsense"), None);
     }
 }

@@ -1,12 +1,8 @@
 //! Chat core: session state and the message -> connector calls -> reply loop.
 //! Knows the connector trait and domain types, never a specific platform or UI.
 
-use std::collections::HashMap;
-
+pub use connectors::Credentials;
 use connectors::Platform;
-
-/// Credentials as entered by the user, keyed by `CredentialField::key`.
-pub type Credentials = HashMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {

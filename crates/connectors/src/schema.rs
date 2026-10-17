@@ -1,3 +1,8 @@
+use std::collections::BTreeMap;
+
+/// Credentials as entered by the user, keyed by `CredentialField::key`.
+pub type Credentials = BTreeMap<String, String>;
+
 /// A single input the credential form must collect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialField {
@@ -36,5 +41,14 @@ impl CredentialSchema {
 
     pub fn fields(&self) -> &[CredentialField] {
         &self.fields
+    }
+
+    /// Labels of required fields that are absent or blank.
+    pub fn missing(&self, creds: &Credentials) -> Vec<&'static str> {
+        self.fields
+            .iter()
+            .filter(|f| creds.get(f.key).is_none_or(|v| v.trim().is_empty()))
+            .map(|f| f.label)
+            .collect()
     }
 }

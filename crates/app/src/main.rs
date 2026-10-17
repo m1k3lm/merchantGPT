@@ -2,7 +2,7 @@
 //! shop connector flow (platform picker, then credential form from the schema).
 
 use chat_core::{Credentials, Role, Session};
-use connectors::Platform;
+use connectors::{ConnectorKind, ConnectorRegistry, Platform};
 use eframe::egui;
 
 fn main() -> eframe::Result {
@@ -117,7 +117,7 @@ impl App {
                 });
             }
             ConnectorFlow::EnterCredentials { platform, values } => {
-                let schema = platform.credential_schema();
+                let schema = ConnectorRegistry::credential_schema(ConnectorKind::Shop(*platform));
                 let title = format!("{} credentials", platform.display_name());
                 egui::Window::new(title).show(ui.ctx(), |ui| {
                     for field in schema.fields() {
