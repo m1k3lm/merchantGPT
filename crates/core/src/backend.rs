@@ -1471,10 +1471,20 @@ mod tests {
         let mut f = fixture();
         shop_with_task(&mut f, "daily 09:00").await;
         f.provider.push_text("Sales were fine").push_text("again");
-        f.backend.run_due_tasks_at(tomorrow_at(8)).await;
+        // The first 09:00 after creation, so the test holds at any local time.
+        let created = to_local(&f.store.list_tasks(None).unwrap()[0].created_at).unwrap();
+        let mut slot = created.date().and_hms_opt(9, 0, 0).unwrap();
+        if slot <= created {
+            slot += chrono::Duration::days(1);
+        }
+        f.backend
+            .run_due_tasks_at(slot - chrono::Duration::minutes(1))
+            .await;
         assert!(f.provider.requests().is_empty(), "not due before 09:00");
-        f.backend.run_due_tasks_at(tomorrow_at(9)).await;
-        f.backend.run_due_tasks_at(tomorrow_at(10)).await;
+        f.backend.run_due_tasks_at(slot).await;
+        f.backend
+            .run_due_tasks_at(slot + chrono::Duration::hours(1))
+            .await;
         assert_eq!(f.provider.requests().len(), 1);
 
         let task = &f.store.list_tasks(None).unwrap()[0];
