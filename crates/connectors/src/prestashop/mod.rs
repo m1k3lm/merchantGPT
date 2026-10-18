@@ -176,9 +176,12 @@ impl PrestaShop {
                     continue
                 }
                 401 | 403 => return Err(ConnectorError::Auth(message())),
+                // A missing record is an empty 404; an HTML one is not the webservice.
                 404 => {
                     return Err(ConnectorError::NotFound(if json_errors {
                         message()
+                    } else if resp.body.trim().is_empty() {
+                        path.to_string()
                     } else {
                         format!("{path} (is the webservice enabled at {}?)", self.base)
                     }))
@@ -1140,6 +1143,29 @@ mod tests {
             .collect();
         assert_eq!(query(&reqs[0], "filter[valid]").as_deref(), Some("[1]"));
         assert_eq!(query(&reqs[1], "limit").as_deref(), Some("100,100"));
+    }
+
+    #[tokio::test]
+    async fn missing_records_are_not_blamed_on_the_webservice() {
+        let t = Arc::new(FakeTransport::new());
+        states(&t);
+        t.on(
+            Method::Get,
+            "/es/api/orders/999",
+            HttpResponse::new(404, ""),
+        );
+        t.on(
+            Method::Get,
+            "/es/api/products",
+            HttpResponse::new(404, "<html>Not Found</html>"),
+        );
+        let s = shop(&t);
+        assert_eq!(
+            s.get_order("999").await.unwrap_err(),
+            ConnectorError::NotFound("orders/999".into())
+        );
+        let err = s.verify().await.unwrap_err().to_string();
+        assert!(err.contains("is the webservice enabled"), "{err}");
     }
 
     #[tokio::test]

@@ -162,3 +162,18 @@ async fn reads_and_writes_a_live_store() {
         .iter()
         .any(|c| c.last_name.eq_ignore_ascii_case("doe")));
 }
+
+#[tokio::test]
+#[ignore = "needs a live PrestaShop store"]
+async fn a_missing_order_is_reported_as_not_found() {
+    let creds = Credentials::from([(WEBSERVICE_KEY.into(), env("PRESTA_KEY"))]);
+    let shop = PrestaShop::new(
+        &env("PRESTA_URL"),
+        &creds,
+        Arc::new(ReqwestTransport::default()),
+    );
+    assert_eq!(
+        shop.get_order("999999").await.unwrap_err(),
+        ConnectorError::NotFound("orders/999999".into())
+    );
+}
