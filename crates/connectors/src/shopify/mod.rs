@@ -3,6 +3,7 @@
 //! secret through the client credentials grant (24-hour tokens, renewed here).
 //! Variants are the products: they carry Shopify's price, SKU and stock.
 
+mod ops;
 mod queries;
 mod types;
 
@@ -138,6 +139,22 @@ fn per_page(requested: Option<u32>, max: u32) -> u32 {
     requested.unwrap_or(DEFAULT_PER_PAGE).clamp(1, max)
 }
 
+/// Whether a GraphQL document defines a mutation operation anywhere, so the
+/// read-only tool cannot run one behind a query or a comment.
+fn is_mutation(document: &str) -> bool {
+    let code: String = document
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.match_indices("mutation").any(|(at, word)| {
+        let before = code[..at].trim_end().chars().last();
+        let after = code[at + word.len()..].chars().next();
+        matches!(before, None | Some('}'))
+            && after.is_none_or(|c| c.is_whitespace() || c == '(' || c == '{')
+    })
+}
+
 /// Shopify shows a sale as `price` below `compareAtPrice`. A sale price of 0
 /// ends the sale.
 fn price_changes(current: &Product, patch: &ProductPatch) -> Map<String, Value> {
@@ -252,7 +269,18 @@ impl Shopify {
     /// never executed by Shopify, so they are retried even for mutations;
     /// transport failures and 5xx only for queries.
     async fn graphql(&self, document: &str, variables: Value) -> Result<Value, ConnectorError> {
-        let mutation = document.trim_start().starts_with("mutation");
+        self.execute(document, variables, false).await
+    }
+
+    /// With `whole`, returns the full response body, GraphQL `errors`
+    /// included, for the raw API tools to show the model.
+    async fn execute(
+        &self,
+        document: &str,
+        variables: Value,
+        whole: bool,
+    ) -> Result<Value, ConnectorError> {
+        let mutation = is_mutation(document);
         let body = json!({"query": document, "variables": variables});
         let url = format!("{}/admin/api/{API_VERSION}/graphql.json", self.base);
         let (mut renew, mut renewed) = (false, false);
@@ -308,12 +336,15 @@ impl Shopify {
             })?;
             let errors = v["errors"].as_array().cloned().unwrap_or_default();
             if errors.is_empty() {
-                return Ok(v["data"].clone());
+                return Ok(if whole { v } else { v["data"].clone() });
             }
             let code = |c: &str| errors.iter().any(|e| e["extensions"]["code"] == c);
             if code("THROTTLED") && retry {
                 self.pause(attempt).await;
                 continue;
+            }
+            if whole {
+                return Ok(v);
             }
             let message = types::messages(&Value::Array(errors.clone())).join("; ");
             return Err(if code("ACCESS_DENIED") {
@@ -330,7 +361,7 @@ impl Shopify {
     async fn page<T>(
         &self,
         document: &str,
-        connection: &str,
+        (connection, ordering): (&str, &str),
         query: Option<String>,
         extra: Value,
         page: Option<u32>,
@@ -352,7 +383,7 @@ impl Shopify {
             total,
         };
         let mut after: Option<String> = None;
-        let walk = queries::cursor(connection);
+        let walk = queries::cursor(connection, ordering);
         for walked in 1..page {
             let vars = json!({"first": per_page, "after": after, "query": query});
             let info = self.graphql(&walk, vars).await?[connection]["pageInfo"].clone();
@@ -404,9 +435,7 @@ impl Shopify {
             .unwrap_or_default();
         let location = match levels.as_slice() {
             [one] => one["location"]["id"].clone(),
-            [] => return Err(bad_request(
-                "this variant is not stocked at any location; add it to a location in the Shopify admin first",
-            )),
+            [] => return self.stock_at_only_location(variant, quantity).await,
             _ => return Err(bad_request(
                 "this variant is stocked at several locations; set the quantity per location in the Shopify admin",
             )),
@@ -430,6 +459,37 @@ impl Shopify {
             )
             .await?;
         check_user_errors(&data["inventorySetQuantities"], "userErrors")
+    }
+
+    /// A variant not stocked anywhere yet (a new product, for one) is
+    /// activated at the shop's location when it has exactly one.
+    async fn stock_at_only_location(
+        &self,
+        variant: &Value,
+        quantity: i64,
+    ) -> Result<(), ConnectorError> {
+        let data = self.graphql(queries::LOCATIONS, json!({})).await?;
+        let locations = data["locations"]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let [location] = locations.as_slice() else {
+            return Err(bad_request(
+                "this variant is not stocked at any location and the shop has several; choose one in the Shopify admin",
+            ));
+        };
+        let data = self
+            .graphql(
+                queries::INVENTORY_ACTIVATE,
+                json!({
+                    "inventoryItemId": variant["inventoryItem"]["id"],
+                    "locationId": location["id"],
+                    "available": quantity,
+                    "idempotencyKey": idempotency_key()
+                }),
+            )
+            .await?;
+        check_user_errors(&data["inventoryActivate"], "userErrors")
     }
 
     async fn order_mutation(
@@ -458,6 +518,123 @@ impl ShopConnector for Shopify {
         self.graphql(queries::SHOP, json!({})).await.map(|_| ())
     }
 
+    /// Shopify discourages deleting orders; cancel them instead.
+    fn hidden(&self) -> &'static [&'static str] {
+        &["shop_manage_order:delete"]
+    }
+
+    fn api_hint(&self) -> &'static str {
+        "Shopify GraphQL Admin API 2026-10: put a GraphQL document in `body` and its variables in `variables`; `path` and `query` are ignored. shop_api_get only runs queries; mutations go through shop_api_write."
+    }
+
+    async fn create_product(&self, p: &ProductPatch) -> Result<Product, ConnectorError> {
+        self.create_product_op(p).await
+    }
+
+    async fn delete_product(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_product_op(id).await
+    }
+
+    async fn list_categories(&self, q: &CategoryQuery) -> Result<Page<Category>, ConnectorError> {
+        self.list_collections(q).await
+    }
+
+    async fn create_category(&self, c: &CategoryPatch) -> Result<Category, ConnectorError> {
+        self.save_collection(None, c).await
+    }
+
+    async fn update_category(
+        &self,
+        id: &str,
+        c: &CategoryPatch,
+    ) -> Result<Category, ConnectorError> {
+        self.save_collection(Some(id), c).await
+    }
+
+    async fn delete_category(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_collection(id).await
+    }
+
+    async fn get_customer(&self, id: &str) -> Result<Customer, ConnectorError> {
+        Ok(self.customer_raw(id).await?.0)
+    }
+
+    async fn create_customer(&self, c: &CustomerPatch) -> Result<Customer, ConnectorError> {
+        self.create_customer_op(c).await
+    }
+
+    async fn update_customer(
+        &self,
+        id: &str,
+        c: &CustomerPatch,
+    ) -> Result<Customer, ConnectorError> {
+        self.update_customer_op(id, c).await
+    }
+
+    async fn delete_customer(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_customer_op(id).await
+    }
+
+    async fn list_addresses(&self, customer_id: &str) -> Result<Vec<Address>, ConnectorError> {
+        self.list_addresses_op(customer_id).await
+    }
+
+    async fn create_address(
+        &self,
+        customer_id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.save_address(customer_id, None, a).await
+    }
+
+    async fn update_address(
+        &self,
+        customer_id: &str,
+        id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.save_address(customer_id, Some(id), a).await
+    }
+
+    async fn delete_address(&self, customer_id: &str, id: &str) -> Result<(), ConnectorError> {
+        self.delete_address_op(customer_id, id).await
+    }
+
+    async fn create_order(&self, o: &NewOrder) -> Result<Order, ConnectorError> {
+        self.create_order_op(o).await
+    }
+
+    async fn add_order_note(&self, id: &str, note: &OrderNote) -> Result<(), ConnectorError> {
+        self.add_order_note_op(id, note).await
+    }
+
+    async fn list_coupons(&self, q: &CouponQuery) -> Result<Page<Coupon>, ConnectorError> {
+        self.list_coupons_op(q).await
+    }
+
+    async fn create_coupon(&self, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.save_coupon(None, c).await
+    }
+
+    async fn update_coupon(&self, id: &str, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.save_coupon(Some(id), c).await
+    }
+
+    async fn delete_coupon(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_coupon_op(id).await
+    }
+
+    async fn list_abandoned_carts(
+        &self,
+        q: &CartQuery,
+    ) -> Result<Page<AbandonedCart>, ConnectorError> {
+        self.list_abandoned_op(q).await
+    }
+
+    async fn raw(&self, req: &RawRequest) -> Result<RawResponse, ConnectorError> {
+        self.raw_op(req).await
+    }
+
     async fn list_products(&self, q: &ProductQuery) -> Result<Page<Product>, ConnectorError> {
         let mut terms = Vec::new();
         if let Some(s) = q.search.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -482,7 +659,7 @@ impl ShopConnector for Shopify {
         };
         self.page(
             &queries::variants(),
-            "productVariants",
+            ("productVariants", queries::BY_ID),
             query,
             json!({}),
             q.page,
@@ -507,9 +684,12 @@ impl ShopConnector for Shopify {
         if patch.is_empty() {
             return Err(bad_request("nothing to change"));
         }
+        if let Some(st) = &patch.status {
+            types::product_status(st)?;
+        }
         let (current, raw) = self.variant(id).await?;
         let product_id = raw["product"]["id"].clone();
-        if patch.name.is_some() || patch.status.is_some() {
+        if patch.name.is_some() || patch.status.is_some() || patch.description.is_some() {
             let mut product = Map::new();
             product.insert("id".into(), product_id.clone());
             if let Some(name) = &patch.name {
@@ -517,6 +697,9 @@ impl ShopConnector for Shopify {
             }
             if let Some(status) = &patch.status {
                 product.insert("status".into(), json!(types::product_status(status)?));
+            }
+            if let Some(html) = &patch.description {
+                product.insert("descriptionHtml".into(), json!(html));
             }
             let data = self
                 .graphql(queries::PRODUCT_UPDATE, json!({"product": product}))
@@ -547,6 +730,10 @@ impl ShopConnector for Shopify {
         if let Some(q) = patch.stock_quantity {
             self.set_stock(&raw, q).await?;
         }
+        if let Some(ids) = &patch.category_ids {
+            self.set_collections(&product_id, &current.category_ids, ids)
+                .await?;
+        }
         self.get_product(&current.id).await
     }
 
@@ -574,7 +761,7 @@ impl ShopConnector for Shopify {
             .await;
         self.page(
             &queries::orders(),
-            "orders",
+            ("orders", queries::NEWEST_ORDERS),
             query,
             json!({"lines": LIST_LINE_ITEMS}),
             q.page,
@@ -675,8 +862,8 @@ impl ShopConnector for Shopify {
             Some(_) => None,
         };
         self.page(
-            queries::CUSTOMERS,
-            "customers",
+            &queries::customers(),
+            ("customers", ""),
             query,
             json!({}),
             q.page,

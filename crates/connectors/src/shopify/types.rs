@@ -72,8 +72,15 @@ pub(crate) fn product(v: &Value) -> Result<Product, ConnectorError> {
     let on_sale = matches!((price, compare_at), (Some(p), Some(c)) if c > p);
     let tracked = v["inventoryItem"]["tracked"].as_bool().unwrap_or(false);
     let stock = v["inventoryQuantity"].as_i64().filter(|_| tracked);
+    // Only the single-variant query asks for collections; lists stay cheap.
+    let category_ids = v["product"]["collections"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| string(&c["id"]))
+        .collect();
     Ok(Product {
-        category_ids: Vec::new(),
+        category_ids,
         id,
         name,
         sku: string(&v["sku"]),
@@ -144,10 +151,15 @@ pub(crate) fn order(o: &Value) -> Result<Order, ConnectorError> {
     })
 }
 
+/// Only `SUBSCRIBED` is consent; pending double opt-ins are not yet.
+fn accepts_marketing(state: &Value) -> Option<bool> {
+    state.as_str().map(|s| s == "SUBSCRIBED")
+}
+
 pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
     Ok(Customer {
-        phone: None,
-        accepts_marketing: None,
+        phone: string(&c["defaultPhoneNumber"]["phoneNumber"]),
+        accepts_marketing: accepts_marketing(&c["defaultEmailAddress"]["marketingState"]),
         id: string(&c["id"])
             .ok_or_else(|| ConnectorError::InvalidResponse("customer without id".into()))?,
         email: string(&c["defaultEmailAddress"]["emailAddress"]).unwrap_or_default(),
@@ -155,6 +167,170 @@ pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
         last_name: string(&c["lastName"]).unwrap_or_default(),
         orders_count: count(&c["numberOfOrders"]),
         total_spent: decimal(&c["amountSpent"]["amount"])?,
+    })
+}
+
+/// Address ids are gids that may carry a query, e.g.
+/// `gid://shopify/MailingAddress/1?model_name=CustomerAddress`, so they are
+/// passed through as listed; a bare number is completed.
+pub(crate) fn address_gid(id: &str) -> Result<String, ConnectorError> {
+    let id = id.trim();
+    if id.starts_with("gid://shopify/MailingAddress/") {
+        Ok(id.to_string())
+    } else {
+        gid("MailingAddress", id)
+    }
+}
+
+/// `kind` is `default` for the customer's default address.
+pub(crate) fn address(a: &Value, default_id: Option<&str>) -> Result<Address, ConnectorError> {
+    let id = string(&a["id"])
+        .ok_or_else(|| ConnectorError::InvalidResponse("address without id".into()))?;
+    Ok(Address {
+        kind: (default_id == Some(id.as_str())).then(|| "default".to_string()),
+        first_name: string(&a["firstName"]),
+        last_name: string(&a["lastName"]),
+        company: string(&a["company"]),
+        address1: string(&a["address1"]),
+        address2: string(&a["address2"]),
+        city: string(&a["city"]),
+        postcode: string(&a["zip"]),
+        state: string(&a["provinceCode"]),
+        country: string(&a["countryCodeV2"]),
+        phone: string(&a["phone"]),
+        id,
+    })
+}
+
+/// A `MailingAddressInput` with only the fields that are set.
+pub(crate) fn address_input(p: &AddressPatch) -> Value {
+    let mut out = serde_json::Map::new();
+    let fields = [
+        ("firstName", &p.first_name),
+        ("lastName", &p.last_name),
+        ("company", &p.company),
+        ("address1", &p.address1),
+        ("address2", &p.address2),
+        ("city", &p.city),
+        ("zip", &p.postcode),
+        ("provinceCode", &p.state),
+        ("phone", &p.phone),
+    ];
+    for (key, value) in fields {
+        if let Some(v) = value {
+            out.insert(key.into(), Value::String(v.trim().to_string()));
+        }
+    }
+    if let Some(c) = &p.country {
+        out.insert(
+            "countryCode".into(),
+            Value::String(c.trim().to_ascii_uppercase()),
+        );
+    }
+    Value::Object(out)
+}
+
+pub(crate) fn wants_default(p: &AddressPatch) -> Option<bool> {
+    p.kind
+        .as_deref()
+        .map(|k| k.trim().eq_ignore_ascii_case("default"))
+}
+
+/// Collections are Shopify's categories; they have no parent.
+pub(crate) fn category(c: &Value) -> Result<Category, ConnectorError> {
+    Ok(Category {
+        id: string(&c["id"])
+            .ok_or_else(|| ConnectorError::InvalidResponse("collection without id".into()))?,
+        name: string(&c["title"]).unwrap_or_default(),
+        parent_id: None,
+        description: string(&c["descriptionHtml"]),
+        count: count(&c["productsCount"]["count"]),
+    })
+}
+
+/// Maps a `DiscountNode` whose discount is a basic code discount; other
+/// discount types (free shipping, buy X get Y, app) are `None`.
+pub(crate) fn coupon(node: &Value) -> Result<Option<Coupon>, ConnectorError> {
+    let d = &node["discount"];
+    if d["__typename"] != "DiscountCodeBasic" {
+        return Ok(None);
+    }
+    let id = string(&node["id"])
+        .ok_or_else(|| ConnectorError::InvalidResponse("discount without id".into()))?;
+    let value = &d["customerGets"]["value"];
+    let (kind, amount) = match value["__typename"].as_str() {
+        Some("DiscountPercentage") => (
+            "percent",
+            decimal(&value["percentage"])?.map(|p| (p * Decimal::from(100)).normalize()),
+        ),
+        Some("DiscountAmount") if value["appliesOnEachItem"] == true => {
+            ("fixed_product", decimal(&value["amount"]["amount"])?)
+        }
+        Some("DiscountAmount") => ("fixed_cart", decimal(&value["amount"]["amount"])?),
+        _ => return Ok(None),
+    };
+    let minimum = &d["minimumRequirement"];
+    Ok(Some(Coupon {
+        id,
+        code: string(&d["codes"]["nodes"][0]["code"]).unwrap_or_default(),
+        kind: kind.into(),
+        amount: amount.unwrap_or_default(),
+        expires_on: d["endsAt"]
+            .as_str()
+            .and_then(|s| s.get(..10))
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        usage_limit: count(&d["usageLimit"]),
+        usage_count: count(&d["asyncUsageCount"]),
+        minimum_amount: if minimum["__typename"] == "DiscountMinimumSubtotal" {
+            decimal(&minimum["greaterThanOrEqualToSubtotal"]["amount"])?
+        } else {
+            None
+        },
+        active: d["status"].as_str().map(|s| s == "ACTIVE"),
+        description: string(&d["title"]),
+    }))
+}
+
+pub(crate) fn abandoned_cart(c: &Value) -> Result<AbandonedCart, ConnectorError> {
+    let customer = &c["customer"];
+    let name = [
+        string(&customer["firstName"]),
+        string(&customer["lastName"]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let money = &c["totalPriceSet"]["shopMoney"];
+    let line_items = c["lineItems"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| {
+            let title = string(&i["title"]).unwrap_or_default();
+            Ok(LineItem {
+                product_id: string(&i["variant"]["id"]),
+                name: match string(&i["variantTitle"]) {
+                    Some(v) if v != DEFAULT_VARIANT_TITLE => format!("{title} - {v}"),
+                    _ => title,
+                },
+                quantity: i["quantity"].as_i64().unwrap_or(0),
+                total: decimal(&i["discountedTotalPriceSet"]["shopMoney"]["amount"])?
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Result<_, ConnectorError>>()?;
+    Ok(AbandonedCart {
+        id: string(&c["id"])
+            .ok_or_else(|| ConnectorError::InvalidResponse("checkout without id".into()))?,
+        customer_id: string(&customer["id"]),
+        email: string(&customer["defaultEmailAddress"]["emailAddress"]),
+        customer_name: Some(name).filter(|n| !n.is_empty()),
+        updated_at: string(&c["updatedAt"]),
+        total: decimal(&money["amount"])?,
+        currency: string(&money["currencyCode"]),
+        line_items,
+        recovery_url: string(&c["abandonedCheckoutUrl"]),
     })
 }
 
