@@ -54,9 +54,49 @@ services:
       - woo-html:/var/www/html
       - ./scripts:/scripts:ro
 
+  presta-db:
+    image: mariadb:11.4
+    profiles: [presta]
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: presta
+      MARIADB_USER: presta
+      MARIADB_PASSWORD: presta
+    volumes:
+      - presta-db:/var/lib/mysql
+
+  presta:
+    # PRESTA_IMAGE can point at an already-pulled image built on the official one.
+    image: ${PRESTA_IMAGE:-prestashop/prestashop:9.2-apache}
+    profiles: [presta]
+    depends_on: [presta-db]
+    # The image's start script exits with an error right after a successful
+    # first install (it removes an install folder the installer already removed).
+    restart: on-failure:3
+    ports:
+      - "8081:80"
+    environment:
+      DB_SERVER: presta-db
+      DB_NAME: presta
+      DB_USER: presta
+      DB_PASSWD: presta
+      PS_INSTALL_AUTO: 1
+      PS_DOMAIN: localhost:8081
+      PS_FOLDER_ADMIN: admin-dev
+      PS_COUNTRY: es
+      PS_LANGUAGE: en
+      PS_ENABLE_SSL: 0
+      ADMIN_MAIL: admin@example.com
+      ADMIN_PASSWD: merchantgpt-admin
+    volumes:
+      - presta-html:/var/www/html
+      - ./scripts:/scripts:ro
+
 volumes:
   target:
   cargo-registry:
   cargo-git:
   woo-db:
   woo-html:
+  presta-db:
+  presta-html:

@@ -13,13 +13,14 @@ pub enum Method {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
 impl Method {
     /// Safe to resend after a transient failure without double-applying.
     fn is_idempotent(self) -> bool {
-        !matches!(self, Method::Post)
+        !matches!(self, Method::Post | Method::Patch)
     }
 }
 
@@ -158,6 +159,7 @@ impl ReqwestTransport {
             Method::Get => reqwest::Method::GET,
             Method::Post => reqwest::Method::POST,
             Method::Put => reqwest::Method::PUT,
+            Method::Patch => reqwest::Method::PATCH,
             Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self

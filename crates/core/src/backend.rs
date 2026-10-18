@@ -1609,15 +1609,25 @@ mod tests {
                 .await;
         }
 
-        /// Answers the platform's verify call; stub platforms need none.
+        /// Answers the calls a platform makes to verify a connection.
         fn accept_shop(&self, platform: Platform) {
             use connectors::transport::{HttpResponse, Method};
-            if platform == Platform::Shopify {
-                self.transport.on(
+            let routes: &[(Method, &str, &str)] = match platform {
+                Platform::Shopify => &[(
                     Method::Post,
                     "/admin/api/2026-10/graphql.json",
-                    HttpResponse::new(200, r#"{"data":{"shop":{"name":"Test"}}}"#),
-                );
+                    r#"{"data":{"shop":{"name":"Test"}}}"#,
+                )],
+                Platform::PrestaShop => &[
+                    (Method::Get, "/api/products", r#"{"products":[]}"#),
+                    (Method::Get, "/api/order_states", r#"{"order_states":[]}"#),
+                    (Method::Get, "/api/currencies", r#"{"currencies":[]}"#),
+                ],
+                _ => &[],
+            };
+            for (method, path, body) in routes {
+                self.transport
+                    .on(*method, path, HttpResponse::new(200, *body));
             }
         }
 
@@ -1851,11 +1861,7 @@ mod tests {
         assert_eq!(log[0].tool, "shop_update_product");
         assert_eq!(log[0].arguments, r#"{"id":"7","regular_price":"9.90"}"#);
         assert_eq!(log[0].conversation_id, f.backend.conversation_id());
-        assert!(log[1]
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("not implemented"));
+        assert!(log[1].detail.as_deref().unwrap().contains("product 7"));
     }
 
     #[tokio::test]

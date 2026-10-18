@@ -23,7 +23,7 @@ It is a native Rust application for macOS, Linux and Windows. There is no accoun
 | WooCommerce | Supported, tested against a real store |
 | Magento 2 | Supported, tested against simulated responses only |
 | Shopify | Supported (GraphQL Admin API 2026-10), tested against simulated responses only |
-| PrestaShop | Can be added, but its operations report "not implemented yet" |
+| PrestaShop 8 and 9 | Supported (webservice), tested against a real PrestaShop 9.2 store |
 
 | AI providers | Notes |
 |---|---|
@@ -91,6 +91,7 @@ Anything compiled into a desktop app can be extracted from the binary. The devel
 - **WooCommerce:** in the WordPress admin go to WooCommerce > Settings > Advanced > REST API, add a key with Read/Write permission, and copy the consumer key and secret. HTTPS stores use Basic auth; plain-HTTP stores are signed with OAuth 1.0a automatically.
 - **Magento 2:** go to System > Integrations, add an integration with API access to Catalog, Sales and Customers, activate it and copy the **Access Token** (the other three values are not used). On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" to Yes. Integration tokens do not expire; rotate one with **Reauthorize**.
 - **Shopify:** either paste the **Admin API access token** of a custom app made in the Shopify admin (Settings > Apps and sales channels > Develop apps; Shopify no longer lets you create new ones there since January 2026), or create an app in the Shopify **Dev Dashboard** under the organization that owns the store, give it the scopes `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_orders`, `write_orders` and `read_customers` (plus `read_all_orders` for orders older than 60 days), install it on the store and enter its **client ID and secret**. The app then fetches 24-hour tokens itself. If your shop URL is a custom domain, also enter the store's `myshopify.com` domain.
+- **PrestaShop 8 or 9:** in the back office go to Advanced Parameters > Webservice, enable the webservice, add a key and give it `products`, `stock_availables` and `specific_prices` (all methods), `orders`, `order_states`, `customers` and `currencies` (GET), and `order_histories` (GET and POST). If the shop is in a subfolder, include it in the shop URL. Status changes accept the shop's own status names (for example "Payment accepted") or common words such as "cancelled" and "shipped"; they do not email the customer.
 
 ### Google Ads
 
@@ -171,11 +172,25 @@ docker compose run --rm ... dev cargo test -p chat-core --test live_woo_agent --
 
 The first exercises the WooCommerce connector; the second runs the whole agent (scripted model, real store, approval and activity log).
 
-To reset the store, remove only its containers and volumes. Do not use `docker compose down -v`, which also deletes the build cache volumes:
+### Live test against a local PrestaShop store
+
+The `presta` compose profile runs PrestaShop 9.2 with its demo catalog and orders at `http://localhost:8081` (back office at `/admin-dev`, `admin@example.com` / `merchantgpt-admin`). The first start installs the shop, which takes a few minutes.
+
+```bash
+docker compose --profile presta up -d presta
+docker compose --profile presta exec presta bash /scripts/presta-setup.sh   # enables the webservice, prints PRESTA_URL, PRESTA_KEY
+PRESTA_URL=http://localhost:8081 PRESTA_KEY=... cargo test -p connectors --test prestashop_live -- --ignored
+```
+
+The test changes one product and one order and puts them back. `PRESTA_IMAGE` can point the service at an already-pulled image built on the official one.
+
+To reset a store, remove only its containers and volumes. Do not use `docker compose down -v`, which also deletes the build cache volumes:
 
 ```bash
 docker compose --profile woo rm -sf woo woo-db woo-cli
 docker volume rm merchantgpt_woo-db merchantgpt_woo-html
+docker compose --profile presta rm -sf presta presta-db
+docker volume rm merchantgpt_presta-db merchantgpt_presta-html
 ```
 
 ## Project layout
@@ -183,7 +198,7 @@ docker volume rm merchantgpt_woo-db merchantgpt_woo-html
 | Path | Purpose |
 |---|---|
 | `crates/tools` | Tool definitions shared by connectors and the AI layer |
-| `crates/connectors` | Shop connectors (WooCommerce, Magento, stubs) and HTTP transport |
+| `crates/connectors` | Shop connectors (WooCommerce, Magento, Shopify, PrestaShop), Google Ads and HTTP transport |
 | `crates/llm` | AI provider clients with streaming and tool calling |
 | `crates/skills` | Skill loading, slash commands and script running |
 | `crates/store` | Encrypted SQLite database and keychain access |
@@ -194,8 +209,8 @@ docker volume rm merchantgpt_woo-db merchantgpt_woo-html
 
 ## Known limitations
 
-- PrestaShop is a placeholder.
 - The Magento, Shopify and Google Ads connectors have not yet been verified against a live store or account.
+- PrestaShop stock can only be set for products without combinations, and product updates need PrestaShop 8 or later (1.7 has no PATCH). Prices are the shop's base prices excluding tax.
 - Shopify orders cannot be fulfilled from the assistant, and cancelling one does not refund it; do both in the Shopify admin.
 - Windows binaries are not produced yet; build on Windows directly or add a CI runner.
 - Shared or published builds must be hosted on seQura's `tech-ai-tools` S3 bucket (request access in Slack #ai-tools).

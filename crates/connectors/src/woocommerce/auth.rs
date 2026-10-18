@@ -38,6 +38,7 @@ fn method_name(m: Method) -> &'static str {
         Method::Get => "GET",
         Method::Post => "POST",
         Method::Put => "PUT",
+        Method::Patch => "PATCH",
         Method::Delete => "DELETE",
     }
 }

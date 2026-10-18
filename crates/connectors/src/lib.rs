@@ -5,6 +5,7 @@ pub mod domain;
 pub mod google_ads;
 pub mod magento;
 pub mod platform;
+pub mod prestashop;
 pub mod registry;
 pub mod schema;
 pub mod shop;

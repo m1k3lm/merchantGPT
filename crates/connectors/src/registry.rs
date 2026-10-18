@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::magento::Magento;
+use crate::prestashop::PrestaShop;
 use crate::schema::CredentialField as F;
 use crate::shop::ShopConnectorAdapter;
 use crate::shopify::Shopify;
-use crate::stub::StubShop;
 use crate::woocommerce::WooCommerce;
 use crate::{
     Connector, ConnectorError, ConnectorKind, CredentialSchema, Credentials, HttpTransport,
@@ -18,6 +18,8 @@ pub struct ConnectorRegistry;
 const MAGENTO_HELP: &str = "In the Magento admin: System > Integrations > Add New Integration, give it API access to Catalog, Sales and Customers, save, then Activate and copy the Access Token. On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > \"Allow OAuth Access Tokens to be used as standalone Bearer tokens\" to Yes.";
 
 const SHOPIFY_HELP: &str = "Use one of two kinds of app. An existing custom app made in the Shopify admin (Settings > Apps and sales channels > Develop apps): copy its Admin API access token; Shopify stopped allowing new ones there in January 2026. Or an app created in the Shopify Dev Dashboard by the organization that owns the store: give it the scopes read_products, write_products, read_inventory, write_inventory, read_orders, write_orders and read_customers (plus read_all_orders for orders older than 60 days), release a version, install it on the store, and copy its client ID and secret. If the shop URL is a custom domain, also enter the store's myshopify.com domain.";
+
+const PRESTASHOP_HELP: &str = "In the PrestaShop back office: Advanced Parameters > Webservice, set \"Enable PrestaShop's webservice\" to Yes, then Add new webservice key. Generate a key and give it these resources: products, stock_availables and specific_prices (all methods), orders, order_states, customers and currencies (GET), and order_histories (GET and POST). Updates need PrestaShop 8 or later. Prices are the shop's prices excluding tax.";
 
 impl ConnectorRegistry {
     pub fn kinds() -> Vec<ConnectorKind> {
@@ -38,9 +40,11 @@ impl ConnectorRegistry {
                 CredentialSchema::new(vec![F::secret("access_token", "Integration access token")])
                     .with_help(MAGENTO_HELP)
             }
-            ConnectorKind::Shop(Platform::PrestaShop) => {
-                CredentialSchema::new(vec![F::secret("webservice_key", "Webservice key")])
-            }
+            ConnectorKind::Shop(Platform::PrestaShop) => CredentialSchema::new(vec![F::secret(
+                crate::prestashop::WEBSERVICE_KEY,
+                "Webservice key",
+            )])
+            .with_help(PRESTASHOP_HELP),
             ConnectorKind::GoogleAds => {
                 use crate::google_ads as g;
                 CredentialSchema::new(vec![
@@ -99,7 +103,9 @@ impl ConnectorRegistry {
             ConnectorKind::Shop(Platform::Shopify) => {
                 Arc::new(Shopify::new(base_url, credentials, transport)?)
             }
-            ConnectorKind::Shop(p) => Arc::new(StubShop(p)),
+            ConnectorKind::Shop(Platform::PrestaShop) => {
+                Arc::new(PrestaShop::new(base_url, credentials, transport))
+            }
         };
         Ok(Arc::new(ShopConnectorAdapter(shop)))
     }
