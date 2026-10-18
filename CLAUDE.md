@@ -17,7 +17,7 @@ Ad-hoc-signed rebuilds change the binary's identity, so macOS may ask to allow k
 
 ## Commands
 
-When piping cargo output through `grep`/`head`, the pipeline's exit code is the filter's, not cargo's. Use `scripts/check.sh` (it sets `pipefail`) as the source of truth.
+When piping cargo output through `grep`/`head`, the pipeline's exit code is the filter's, not cargo's. Use `scripts/check.sh` (it sets `pipefail`) as the source of truth. If it fails with `ld terminated with signal 9 [Killed]`, the Docker VM ran out of memory while linking test binaries; stop the `woo`/`presta` stores (and other projects' containers) and rerun.
 
 ```bash
 # macOS host: native build and run (window opens on your desktop)
