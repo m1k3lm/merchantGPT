@@ -74,7 +74,6 @@ pub(crate) fn product(p: &Value, stock: Option<i64>) -> Result<Product, Connecto
     let price = decimal(&p["final"])?.or(regular);
     let on_sale = matches!((price, regular), (Some(f), Some(r)) if f < r);
     Ok(Product {
-        category_ids: Vec::new(),
         id,
         name: text(&p["name"]).unwrap_or_default(),
         sku: string(&p["reference"]),
@@ -88,6 +87,10 @@ pub(crate) fn product(p: &Value, stock: Option<i64>) -> Result<Product, Connecto
         sale_price: if on_sale { price } else { None },
         stock_quantity: stock,
         stock_status: stock.map(|q| if q > 0 { "instock" } else { "outofstock" }.to_string()),
+        category_ids: string(&p["id_category_default"])
+            .filter(|c| c != "0")
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -222,7 +225,8 @@ pub(crate) fn order(o: &Value, refs: &OrderRefs) -> Result<Order, ConnectorError
 pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
     Ok(Customer {
         phone: None,
-        accepts_marketing: None,
+        // `newsletter` is the shop's own marketing opt-in.
+        accepts_marketing: int(&c["newsletter"]).map(|n| n == 1),
         id: string(&c["id"])
             .ok_or_else(|| ConnectorError::InvalidResponse("customer without id".into()))?,
         email: string(&c["email"]).unwrap_or_default(),
@@ -230,6 +234,111 @@ pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
         last_name: string(&c["lastname"]).unwrap_or_default(),
         orders_count: None,
         total_spent: None,
+    })
+}
+
+/// A `link_rewrite`: lowercase ASCII words joined by dashes.
+pub(crate) fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().flat_map(char::to_lowercase) {
+        let c = match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ñ' => 'n',
+            'ç' => 'c',
+            c => c,
+        };
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "item".into()
+    } else {
+        out
+    }
+}
+
+pub(crate) fn category(c: &Value) -> Result<Category, ConnectorError> {
+    Ok(Category {
+        id: string(&c["id"])
+            .ok_or_else(|| ConnectorError::InvalidResponse("category without id".into()))?,
+        name: text(&c["name"]).unwrap_or_default(),
+        parent_id: string(&c["id_parent"]).filter(|p| p != "0"),
+        description: text(&c["description"]),
+        count: int(&c["nb_products_recursive"])
+            .filter(|n| *n >= 0)
+            .map(|n| n as u64),
+    })
+}
+
+/// Countries and states by id, to show addresses with ISO codes.
+#[derive(Default)]
+pub(crate) struct Places {
+    pub countries: std::collections::HashMap<String, String>,
+    pub states: std::collections::HashMap<String, String>,
+}
+
+pub(crate) fn address(a: &Value, places: &Places) -> Result<Address, ConnectorError> {
+    let lookup = |map: &std::collections::HashMap<String, String>, k: &str| {
+        string(&a[k])
+            .filter(|v| v != "0")
+            .map(|id| map.get(&id).cloned().unwrap_or(id))
+    };
+    Ok(Address {
+        id: string(&a["id"])
+            .ok_or_else(|| ConnectorError::InvalidResponse("address without id".into()))?,
+        kind: string(&a["alias"]),
+        first_name: string(&a["firstname"]),
+        last_name: string(&a["lastname"]),
+        company: string(&a["company"]),
+        address1: string(&a["address1"]),
+        address2: string(&a["address2"]),
+        city: string(&a["city"]),
+        postcode: string(&a["postcode"]),
+        state: lookup(&places.states, "id_state"),
+        country: lookup(&places.countries, "id_country"),
+        phone: string(&a["phone"]).or_else(|| string(&a["phone_mobile"])),
+    })
+}
+
+fn date(v: &Value) -> Option<chrono::NaiveDate> {
+    let s = string(v)?;
+    chrono::NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()
+}
+
+/// Cart rules: a percent or an amount off the order.
+pub(crate) fn coupon(c: &Value) -> Result<Coupon, ConnectorError> {
+    let percent = decimal(&c["reduction_percent"])?.unwrap_or_default();
+    let amount = decimal(&c["reduction_amount"])?.unwrap_or_default();
+    let (kind, value) = if percent > Decimal::ZERO {
+        ("percent", percent)
+    } else if amount > Decimal::ZERO {
+        ("fixed_cart", amount)
+    } else if int(&c["free_shipping"]) == Some(1) {
+        ("free_shipping", Decimal::ZERO)
+    } else {
+        ("other", Decimal::ZERO)
+    };
+    Ok(Coupon {
+        id: string(&c["id"])
+            .ok_or_else(|| ConnectorError::InvalidResponse("cart rule without id".into()))?,
+        code: string(&c["code"]).unwrap_or_default(),
+        kind: kind.into(),
+        amount: value,
+        expires_on: date(&c["date_to"]),
+        // PrestaShop counts the uses left down, so this is what remains.
+        usage_limit: int(&c["quantity"]).map(|q| q.max(0) as u64),
+        usage_count: None,
+        minimum_amount: decimal(&c["minimum_amount"])?.filter(|m| !m.is_zero()),
+        active: int(&c["active"]).map(|a| a == 1),
+        description: string(&c["description"]).or_else(|| text(&c["name"])),
     })
 }
 
@@ -317,6 +426,26 @@ mod tests {
             (no_sale.sale_price, no_sale.status.as_deref()),
             (None, Some("inactive"))
         );
+    }
+
+    #[test]
+    fn slugs_fold_accents_and_punctuation() {
+        assert_eq!(slug("Taza Ñandú: ¡Edición 2!"), "taza-nandu-edicion-2");
+        assert_eq!(slug("***"), "item");
+    }
+
+    #[test]
+    fn cart_rules_map_to_coupons() {
+        let c = coupon(
+            &json!({"id": 4, "code": "SPRING", "reduction_percent": "10.00",
+            "reduction_amount": "0.000000", "date_to": "2027-03-31 23:59:59", "quantity": "97",
+            "minimum_amount": "0.000000", "active": "1", "name": [{"id": 1, "value": "Spring"}]}),
+        )
+        .unwrap();
+        assert_eq!((c.kind.as_str(), c.amount), ("percent", Decimal::from(10)));
+        assert_eq!(c.expires_on, chrono::NaiveDate::from_ymd_opt(2027, 3, 31));
+        assert_eq!((c.usage_limit, c.minimum_amount), (Some(97), None));
+        assert_eq!(c.description.as_deref(), Some("Spring"));
     }
 
     #[test]

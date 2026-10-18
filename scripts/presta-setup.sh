@@ -24,10 +24,16 @@ if (!WebserviceKey::keyExists($key)) {
     $account->description = 'merchantGPT local tests';
     $account->active = 1;
     $account->add();
-    $methods = array_fill_keys(['GET', 'PUT', 'POST', 'PATCH', 'DELETE', 'HEAD'], 'on');
-    $resources = ['products', 'combinations', 'stock_availables', 'specific_prices', 'orders',
-        'order_states', 'order_histories', 'customers', 'currencies', 'languages', 'configurations'];
-    WebserviceKey::setPermissionForAccount($account->id, array_fill_keys($resources, $methods));
 }
+// Re-applied on every run, so an existing key gains newly used resources.
+$id = (int) Db::getInstance()->getValue(
+    'SELECT id_webservice_account FROM ' . _DB_PREFIX_ . "webservice_account WHERE `key` = '" . pSQL($key) . "'"
+);
+$methods = array_fill_keys(['GET', 'PUT', 'POST', 'PATCH', 'DELETE', 'HEAD'], 'on');
+$resources = ['products', 'categories', 'combinations', 'stock_availables', 'specific_prices',
+    'orders', 'order_states', 'order_histories', 'order_carriers', 'carriers', 'customers',
+    'addresses', 'countries', 'states', 'currencies', 'languages', 'carts', 'cart_rules',
+    'customer_threads', 'customer_messages'];
+WebserviceKey::setPermissionForAccount($id, array_fill_keys($resources, $methods));
 echo "PRESTA_URL=http://localhost:8081\nPRESTA_KEY=$key\n";
 PHP

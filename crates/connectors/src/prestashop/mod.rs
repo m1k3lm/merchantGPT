@@ -2,6 +2,9 @@
 //! webservice key as the Basic auth user. Reads ask for JSON; writes must be
 //! XML and use PATCH, so updates need PrestaShop 8 or later.
 
+mod catalog;
+mod people;
+mod sales;
 mod types;
 mod xml;
 
@@ -16,7 +19,7 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 
 use crate::domain::*;
-use crate::transport::{HttpRequest, HttpTransport, Method};
+use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 use crate::{ConnectorError, Credentials, Platform, ShopConnector};
 use types::OrderState;
 use xml::Field;
@@ -29,7 +32,8 @@ const MAX_PER_PAGE: u32 = 100;
 const MAX_ORDERS_PER_PAGE: u32 = 50;
 const REPORT_PAGE: u32 = 100;
 const MAX_REPORT_ORDERS: u64 = 5_000;
-const PRODUCT_FIELDS: &str = "[id,name,reference,price,final,active,cache_default_attribute]";
+const PRODUCT_FIELDS: &str =
+    "[id,name,reference,price,final,active,cache_default_attribute,id_category_default]";
 
 type Params = Vec<(String, String)>;
 
@@ -47,6 +51,8 @@ pub struct PrestaShop {
     /// goes in the `ws_key` query parameter instead.
     key_in_query: AtomicBool,
     meta: tokio::sync::Mutex<Option<Arc<Meta>>>,
+    /// Ids of the shop's languages; multilang writes must carry every one.
+    languages: tokio::sync::Mutex<Option<Vec<u64>>>,
 }
 
 impl std::fmt::Debug for PrestaShop {
@@ -130,21 +136,61 @@ impl PrestaShop {
             transport,
             key_in_query: AtomicBool::new(false),
             meta: tokio::sync::Mutex::new(None),
+            languages: tokio::sync::Mutex::new(None),
         }
     }
 
     fn url(&self, path: &str, params: &[(String, String)]) -> Result<String, ConnectorError> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/{path}", self.base))
-            .map_err(|e| ConnectorError::InvalidCredentials(format!("bad shop URL: {e}")))?;
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/api/{}",
+            self.base,
+            path.trim_start_matches('/')
+        ))
+        .map_err(|e| ConnectorError::InvalidCredentials(format!("bad shop URL: {e}")))?;
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("output_format", "JSON");
+            if !params.iter().any(|(k, _)| k == "output_format") {
+                q.append_pair("output_format", "JSON");
+            }
             q.extend_pairs(params);
             if self.key_in_query.load(Ordering::Relaxed) {
                 q.append_pair("ws_key", &self.key);
             }
         }
         Ok(url.to_string())
+    }
+
+    /// One request, retried with `ws_key` when the server stripped the header.
+    async fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(String, String)],
+        body: Option<&str>,
+    ) -> Result<HttpResponse, ConnectorError> {
+        loop {
+            let mut req = HttpRequest::new(method, self.url(path, params)?)
+                .header(
+                    "Authorization",
+                    format!("Basic {}", BASE64_STANDARD.encode(format!("{}:", self.key))),
+                )
+                .header("Accept", "application/json");
+            if let Some(b) = body {
+                req = req.header("Content-Type", "application/xml");
+                req.body = Some(b.to_string());
+            }
+            let resp = self.transport.send(req).await?;
+            let json_errors =
+                serde_json::from_str::<Value>(&resp.body).is_ok_and(|v| v["errors"].is_array());
+            // A plain-text 401 means the key never reached PrestaShop.
+            if resp.status == 401
+                && !json_errors
+                && !self.key_in_query.swap(true, Ordering::Relaxed)
+            {
+                continue;
+            }
+            return Ok(resp);
+        }
     }
 
     async fn send(
@@ -154,63 +200,111 @@ impl PrestaShop {
         params: &[(String, String)],
         body: Option<String>,
     ) -> Result<Value, ConnectorError> {
-        loop {
-            let mut req = HttpRequest::new(method, self.url(path, params)?)
-                .header(
-                    "Authorization",
-                    format!("Basic {}", BASE64_STANDARD.encode(format!("{}:", self.key))),
-                )
-                .header("Accept", "application/json");
-            if let Some(b) = &body {
-                req = req.header("Content-Type", "application/xml");
-                req.body = Some(b.clone());
+        let resp = self.exchange(method, path, params, body.as_deref()).await?;
+        let message = || types::error_message(&resp.body);
+        let json_errors =
+            serde_json::from_str::<Value>(&resp.body).is_ok_and(|v| v["errors"].is_array());
+        match resp.status {
+            200..=299 => {}
+            401 | 403 => return Err(ConnectorError::Auth(message())),
+            // A missing record is an empty 404; an HTML one is not the webservice.
+            404 => {
+                return Err(ConnectorError::NotFound(if json_errors {
+                    message()
+                } else if resp.body.trim().is_empty() {
+                    path.to_string()
+                } else {
+                    format!("{path} (is the webservice enabled at {}?)", self.base)
+                }))
             }
-            let resp = self.transport.send(req).await?;
-            let message = || types::error_message(&resp.body);
-            let json_errors =
-                serde_json::from_str::<Value>(&resp.body).is_ok_and(|v| v["errors"].is_array());
-            match resp.status {
-                200..=299 => {}
-                // A plain-text 401 means the key never reached PrestaShop.
-                401 if !json_errors && !self.key_in_query.swap(true, Ordering::Relaxed) => {
-                    continue
-                }
-                401 | 403 => return Err(ConnectorError::Auth(message())),
-                // A missing record is an empty 404; an HTML one is not the webservice.
-                404 => {
-                    return Err(ConnectorError::NotFound(if json_errors {
-                        message()
-                    } else if resp.body.trim().is_empty() {
-                        path.to_string()
-                    } else {
-                        format!("{path} (is the webservice enabled at {}?)", self.base)
-                    }))
-                }
-                405 => {
-                    return Err(ConnectorError::Api {
-                        status: 405,
-                        message: format!(
-                            "this shop does not accept {method:?} on {path}; updates need PrestaShop 8 or later"
-                        ),
-                    })
-                }
-                status => {
-                    return Err(ConnectorError::Api {
-                        status,
-                        message: message(),
-                    })
-                }
+            405 => {
+                return Err(ConnectorError::Api {
+                    status: 405,
+                    message: format!(
+                        "this shop does not accept {method:?} on {path}; updates need PrestaShop 8 or later"
+                    ),
+                })
             }
-            if resp.body.trim().is_empty() {
-                return Ok(Value::Null);
+            status => {
+                return Err(ConnectorError::Api {
+                    status,
+                    message: message(),
+                })
             }
-            return serde_json::from_str(&resp.body).map_err(|_| {
-                ConnectorError::InvalidResponse(format!(
-                    "{} did not answer like the PrestaShop webservice; check the shop URL and that the webservice is enabled",
-                    self.base
-                ))
-            });
         }
+        if resp.body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&resp.body).map_err(|_| {
+            ConnectorError::InvalidResponse(format!(
+                "{} did not answer like the PrestaShop webservice; check the shop URL and that the webservice is enabled",
+                self.base
+            ))
+        })
+    }
+
+    async fn post(&self, path: &str, doc: String) -> Result<Value, ConnectorError> {
+        self.send(Method::Post, path, &[], Some(doc)).await
+    }
+
+    async fn patch(&self, path: &str, doc: String) -> Result<Value, ConnectorError> {
+        self.send(Method::Patch, path, &[], Some(doc)).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), ConnectorError> {
+        self.send(Method::Delete, path, &[], None).await.map(|_| ())
+    }
+
+    /// The id a write answered with, e.g. `{"product": {"id": "21"}}`.
+    fn created_id(v: &Value, resource: &str) -> Result<String, ConnectorError> {
+        types::string(&v[resource]["id"]).ok_or_else(|| {
+            ConnectorError::InvalidResponse(format!("PrestaShop did not return the new {resource}"))
+        })
+    }
+
+    async fn languages(&self) -> Result<Vec<u64>, ConnectorError> {
+        let mut cached = self.languages.lock().await;
+        if let Some(l) = cached.as_ref() {
+            return Ok(l.clone());
+        }
+        let v = self
+            .get("languages", vec![("display".into(), "[id]".into())])
+            .await?;
+        let mut ids: Vec<u64> = list(&v, "languages")
+            .iter()
+            .filter_map(|l| types::int(&l["id"]).map(|i| i as u64))
+            .collect();
+        ids.sort_unstable();
+        if ids.is_empty() {
+            ids.push(1);
+        }
+        *cached = Some(ids.clone());
+        Ok(ids)
+    }
+
+    /// The same text in every language, for a new record.
+    async fn every_language(&self, text: &str) -> Result<Field, ConnectorError> {
+        Ok(Field::Lang(
+            self.languages()
+                .await?
+                .into_iter()
+                .map(|id| (id, text.to_string()))
+                .collect(),
+        ))
+    }
+
+    /// A multilang field with the merchant's language set to `text` and the
+    /// other languages kept, or every language when none has text yet.
+    async fn one_language(&self, current: &Value, text: &str) -> Result<Field, ConnectorError> {
+        let mut langs = types::languages(current);
+        if langs.is_empty() {
+            return self.every_language(text).await;
+        }
+        match langs.iter().position(|(_, v)| !v.is_empty()) {
+            Some(i) => langs[i].1 = text.to_string(),
+            None => langs.iter_mut().for_each(|l| l.1 = text.to_string()),
+        }
+        Ok(Field::Lang(langs))
     }
 
     async fn get(&self, path: &str, params: Params) -> Result<Value, ConnectorError> {
@@ -489,7 +583,9 @@ impl ShopConnector for PrestaShop {
     }
 
     async fn get_product(&self, id: &str) -> Result<Product, ConnectorError> {
-        Ok(self.product_raw(id).await?.1)
+        let mut product = self.product_raw(id).await?.1;
+        product.category_ids = self.product_categories(&product.id).await?;
+        Ok(product)
     }
 
     /// Prices are the base prices excluding tax. A sale price replaces the
@@ -522,13 +618,18 @@ impl ShopConnector for PrestaShop {
         if let Some(name) = &patch.name {
             // The language shown to the merchant changes; the others keep
             // their translations.
-            let mut langs = types::languages(&raw["name"]);
-            match langs.iter().position(|(_, v)| !v.is_empty()) {
-                Some(i) => langs[i].1 = name.clone(),
-                None if langs.is_empty() => langs.push((1, name.clone())),
-                None => langs[0].1 = name.clone(),
-            }
-            fields.push(("name", Field::Lang(langs)));
+            fields.push(("name", self.one_language(&raw["name"], name).await?));
+        }
+        if let Some(description) = &patch.description {
+            let current = self.product_texts(&id).await?;
+            fields.push((
+                "description",
+                self.one_language(&current["description"], description)
+                    .await?,
+            ));
+        }
+        if let Some(categories) = &patch.category_ids {
+            fields.extend(self.category_fields(categories).await?);
         }
         if let Some(sku) = &patch.sku {
             fields.push(("reference", Field::Text(sku.trim().into())));
@@ -552,24 +653,7 @@ impl ShopConnector for PrestaShop {
             self.set_sale(&id, regular, sale).await?;
         }
         if let Some(q) = patch.stock_quantity {
-            let rows = self.stock(std::slice::from_ref(&id)).await?;
-            let Some((row, _)) = rows.get(&id) else {
-                return Err(bad_request("PrestaShop has no stock row for this product"));
-            };
-            let doc = xml::document(
-                "stock_available",
-                &[
-                    ("id", Field::Text(row.clone())),
-                    ("quantity", Field::Text(q.to_string())),
-                ],
-            );
-            self.send(
-                Method::Patch,
-                &format!("stock_availables/{row}"),
-                &[],
-                Some(doc),
-            )
-            .await?;
+            self.set_product_stock(&id, q).await?;
         }
         self.get_product(&id).await
     }
@@ -658,7 +742,7 @@ impl ShopConnector for PrestaShop {
     /// first names.
     async fn list_customers(&self, q: &CustomerQuery) -> Result<Page<Customer>, ConnectorError> {
         let base: Params = vec![
-            ("display".into(), "[id,email,firstname,lastname]".into()),
+            ("display".into(), people::CUSTOMER_FIELDS.into()),
             ("sort".into(), "[id_ASC]".into()),
         ];
         let mut attempts: Vec<Params> = Vec::new();
@@ -754,6 +838,122 @@ impl ShopConnector for PrestaShop {
             report.currency = currencies.into_iter().next();
         }
         Ok(report)
+    }
+
+    fn api_hint(&self) -> &'static str {
+        "PrestaShop webservice: path relative to /api (e.g. /carriers, /order_carriers/3); reads return JSON (output_format=JSON is added) and take query filter[field]=[value], display=[a,b], limit=offset,count; writes take an XML string body such as <prestashop><carrier><id>3</id>...</carrier></prestashop> and use PATCH for partial updates."
+    }
+
+    async fn create_product(&self, product: &ProductPatch) -> Result<Product, ConnectorError> {
+        self.create_product_in(product).await
+    }
+
+    async fn delete_product(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_product_by_id(id).await
+    }
+
+    async fn list_categories(&self, q: &CategoryQuery) -> Result<Page<Category>, ConnectorError> {
+        self.categories_page(q).await
+    }
+
+    async fn create_category(&self, c: &CategoryPatch) -> Result<Category, ConnectorError> {
+        self.create_category_in(c).await
+    }
+
+    async fn update_category(
+        &self,
+        id: &str,
+        c: &CategoryPatch,
+    ) -> Result<Category, ConnectorError> {
+        self.update_category_in(id, c).await
+    }
+
+    async fn delete_category(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_category_by_id(id).await
+    }
+
+    async fn get_customer(&self, id: &str) -> Result<Customer, ConnectorError> {
+        self.customer_by_id(id).await
+    }
+
+    async fn create_customer(&self, c: &CustomerPatch) -> Result<Customer, ConnectorError> {
+        self.create_customer_in(c).await
+    }
+
+    async fn update_customer(
+        &self,
+        id: &str,
+        c: &CustomerPatch,
+    ) -> Result<Customer, ConnectorError> {
+        self.update_customer_in(id, c).await
+    }
+
+    async fn delete_customer(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_customer_by_id(id).await
+    }
+
+    async fn list_addresses(&self, customer_id: &str) -> Result<Vec<Address>, ConnectorError> {
+        self.addresses_of(customer_id).await
+    }
+
+    async fn create_address(
+        &self,
+        customer_id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.create_address_for(customer_id, a).await
+    }
+
+    async fn update_address(
+        &self,
+        customer_id: &str,
+        id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.update_address_for(customer_id, id, a).await
+    }
+
+    async fn delete_address(&self, customer_id: &str, id: &str) -> Result<(), ConnectorError> {
+        self.delete_address_for(customer_id, id).await
+    }
+
+    async fn create_order(&self, o: &NewOrder) -> Result<Order, ConnectorError> {
+        self.create_order_in(o).await
+    }
+
+    async fn add_order_note(&self, id: &str, note: &OrderNote) -> Result<(), ConnectorError> {
+        self.order_note(id, note).await
+    }
+
+    async fn delete_order(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_order_by_id(id).await
+    }
+
+    async fn list_coupons(&self, q: &CouponQuery) -> Result<Page<Coupon>, ConnectorError> {
+        self.coupons_page(q).await
+    }
+
+    async fn create_coupon(&self, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.create_coupon_in(c).await
+    }
+
+    async fn update_coupon(&self, id: &str, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.update_coupon_in(id, c).await
+    }
+
+    async fn delete_coupon(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_coupon_by_id(id).await
+    }
+
+    async fn list_abandoned_carts(
+        &self,
+        q: &CartQuery,
+    ) -> Result<Page<AbandonedCart>, ConnectorError> {
+        self.abandoned(q).await
+    }
+
+    async fn raw(&self, req: &RawRequest) -> Result<RawResponse, ConnectorError> {
+        self.raw_request(req).await
     }
 }
 
@@ -914,6 +1114,12 @@ mod tests {
             Method::Get,
             "/es/api/products",
             json!({"products": [mug()]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/products/6",
+            json!({"product": {"id": 6, "associations": {"categories": [{"id": 2}]}}}),
         );
         ok(
             &t,
@@ -1199,5 +1405,395 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("PrestaShop 8"), "{err}");
+    }
+
+    fn body_of(t: &FakeTransport, method: Method, path: &str) -> String {
+        t.requests()
+            .into_iter()
+            .find(|r| r.method == method && r.path() == path)
+            .and_then(|r| r.body)
+            .unwrap_or_else(|| panic!("no {method:?} {path}"))
+    }
+
+    fn languages(t: &FakeTransport) {
+        ok(
+            t,
+            Method::Get,
+            "/es/api/languages",
+            json!({"languages": [{"id": 2}, {"id": 1}]}),
+        );
+    }
+
+    #[tokio::test]
+    async fn new_products_get_every_language_a_slug_and_their_categories() {
+        let t = Arc::new(FakeTransport::new());
+        languages(&t);
+        t.on(
+            Method::Post,
+            "/es/api/products",
+            HttpResponse::new(201, r#"{"product":{"id":"21"}}"#),
+        );
+        let mut created = mug();
+        created["id"] = json!(21);
+        created["id_category_default"] = json!(5);
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/products",
+            json!({"products": [created]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/stock_availables",
+            json!({"stock_availables": [{"id": 70, "id_product": 21, "quantity": 0}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/products/21",
+            json!({"product": {"id": 21, "associations": {"categories": [{"id": 5}, {"id": 2}]}}}),
+        );
+        let p = shop(&t)
+            .create_product(&ProductPatch {
+                name: Some("Taza Ñandú".into()),
+                regular_price: Some(dec("9.5")),
+                category_ids: Some(vec!["5".into(), "2".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(p.category_ids, ["5", "2"]);
+        let body = body_of(&t, Method::Post, "/es/api/products");
+        assert!(body.contains("<name><language id=\"1\">Taza Ñandú</language><language id=\"2\">Taza Ñandú</language></name>"), "{body}");
+        assert!(
+            body.contains("<link_rewrite><language id=\"1\">taza-nandu</language>"),
+            "{body}"
+        );
+        assert!(body.contains("<id_category_default>5</id_category_default><associations><categories><category><id>5</id></category><category><id>2</id></category></categories></associations>"), "{body}");
+        assert!(body.contains("<product_type>standard</product_type>"));
+    }
+
+    #[tokio::test]
+    async fn order_notes_are_private_and_never_emailed() {
+        let t = Arc::new(FakeTransport::new());
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/orders",
+            json!({"orders": [{"id": 2, "note": "First"}]}),
+        );
+        ok(&t, Method::Patch, "/es/api/orders/2", json!({}));
+        let s = shop(&t);
+        let email = s
+            .add_order_note(
+                "2",
+                &OrderNote {
+                    note: "Hi".into(),
+                    notify_customer: true,
+                },
+            )
+            .await;
+        assert!(matches!(email, Err(ConnectorError::Unsupported(_))));
+        assert!(t.requests().is_empty());
+        s.add_order_note(
+            "2",
+            &OrderNote {
+                note: "Second".into(),
+                notify_customer: false,
+            },
+        )
+        .await
+        .unwrap();
+        let body = body_of(&t, Method::Patch, "/es/api/orders/2");
+        assert!(
+            body.contains("<order><id>2</id><note>First\nSecond</note></order>"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_are_placed_from_a_cart_at_prestashops_own_total() {
+        let t = Arc::new(FakeTransport::new());
+        states(&t);
+        languages(&t);
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/carriers",
+            json!({"carriers": [{"id": 1}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/addresses",
+            json!({"addresses": [{"id": 5, "id_customer": 7, "id_country": 8, "id_state": 0, "postcode": "75001"}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/countries",
+            json!({"countries": [{"id": 8, "iso_code": "FR"}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/products",
+            json!({"products": [{"id": 6, "cache_default_attribute": 0, "pay": "14.399000"}]}),
+        );
+        t.on(
+            Method::Post,
+            "/es/api/carts",
+            HttpResponse::new(201, r#"{"cart":{"id":"9"}}"#),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/orders",
+            json!({"orders": [{"id": 3, "module": "ps_checkpayment"}]}),
+        );
+        t.on(
+            Method::Post,
+            "/es/api/orders",
+            HttpResponse::new(201, r#"{"order":{"id":12}}"#),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/orders/12",
+            json!({"order": {"id": 12, "reference": "R12", "current_state": 2, "id_customer": 0,
+                "id_currency": 1, "total_paid_tax_incl": "28.800000"}}),
+        );
+        let order = shop(&t)
+            .create_order(&NewOrder {
+                customer_id: Some("7".into()),
+                line_items: vec![NewLineItem {
+                    product_id: "6".into(),
+                    quantity: 2,
+                    price: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!((order.id.as_str(), order.total), ("12", dec("28.8")));
+        let price = t
+            .requests()
+            .into_iter()
+            .find(|r| r.path() == "/es/api/products")
+            .unwrap();
+        assert_eq!(query(&price, "price[pay][country]").as_deref(), Some("8"));
+        assert_eq!(query(&price, "price[pay][quantity]").as_deref(), Some("2"));
+        let cart = body_of(&t, Method::Post, "/es/api/carts");
+        assert!(cart.contains("<id_carrier>1</id_carrier>"), "{cart}");
+        assert!(cart.contains("<cart_row><id_product>6</id_product><id_product_attribute>0</id_product_attribute><id_address_delivery>5</id_address_delivery><quantity>2</quantity></cart_row>"), "{cart}");
+        let placed = body_of(&t, Method::Post, "/es/api/orders");
+        assert!(placed.contains("<id_cart>9</id_cart>"), "{placed}");
+        assert!(
+            placed.contains("<module>ps_checkpayment</module>"),
+            "{placed}"
+        );
+        assert!(
+            placed.contains("<total_paid>28.80</total_paid>"),
+            "{placed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_without_a_free_carrier_or_with_custom_prices_are_refused() {
+        let t = Arc::new(FakeTransport::new());
+        ok(&t, Method::Get, "/es/api/carriers", json!([]));
+        let s = shop(&t);
+        let line = |price: Option<Decimal>| NewOrder {
+            customer_id: Some("7".into()),
+            line_items: vec![NewLineItem {
+                product_id: "6".into(),
+                quantity: 1,
+                price,
+            }],
+            ..Default::default()
+        };
+        for order in [line(Some(dec("5"))), line(None)] {
+            let err = s.create_order(&order).await.unwrap_err();
+            assert!(matches!(err, ConnectorError::Unsupported(_)), "{err}");
+        }
+        assert!(t.requests().iter().all(|r| r.method == Method::Get));
+    }
+
+    #[tokio::test]
+    async fn coupons_and_addresses_explain_what_prestashop_cannot_take() {
+        let t = Arc::new(FakeTransport::new());
+        languages(&t);
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/countries",
+            json!({"countries": [{"id": 6, "contains_states": "1", "need_identification_number": "1"}]}),
+        );
+        let s = shop(&t);
+        let coupon = s
+            .create_coupon(&CouponPatch {
+                code: Some("X".into()),
+                kind: Some("fixed_product".into()),
+                amount: Some(dec("5")),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(coupon, Err(ConnectorError::Unsupported(_))));
+        let address = s
+            .create_address(
+                "7",
+                &AddressPatch {
+                    first_name: Some("A".into()),
+                    last_name: Some("B".into()),
+                    address1: Some("Calle Mayor 1".into()),
+                    city: Some("Madrid".into()),
+                    country: Some("es".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(address, Err(ConnectorError::Unsupported(ref m)) if m.contains("DNI")),
+            "{address:?}"
+        );
+        assert!(t.requests().iter().all(|r| r.method == Method::Get));
+    }
+
+    #[tokio::test]
+    async fn new_coupons_are_unlimited_unless_limited() {
+        let t = Arc::new(FakeTransport::new());
+        languages(&t);
+        t.on(
+            Method::Post,
+            "/es/api/cart_rules",
+            HttpResponse::new(201, r#"{"cart_rule":{"id":"4"}}"#),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/cart_rules",
+            json!({"cart_rules": [{"id": 4, "code": "SPRING", "reduction_percent": "10", "quantity": "999999", "active": "1"}]}),
+        );
+        let c = shop(&t)
+            .create_coupon(&CouponPatch {
+                code: Some("SPRING".into()),
+                kind: Some("percent".into()),
+                amount: Some(dec("10")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(c.code, "SPRING");
+        let body = body_of(&t, Method::Post, "/es/api/cart_rules");
+        for part in [
+            "<reduction_percent>10</reduction_percent>",
+            "<date_to>2099-12-31 23:59:59</date_to>",
+            "<quantity>999999</quantity>",
+            "<partial_use>0</partial_use>",
+            "<name><language id=\"1\">SPRING</language><language id=\"2\">SPRING</language></name>",
+        ] {
+            assert!(body.contains(part), "{part} in {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_carts_leave_out_carts_that_became_orders() {
+        let t = Arc::new(FakeTransport::new());
+        states(&t);
+        let cart = |id: u64| {
+            json!({"id": id, "id_customer": 2, "id_currency": 1, "date_upd": "2026-10-18 10:00:00",
+                "associations": {"cart_rows": [{"id_product": 6, "id_product_attribute": 0, "quantity": 2}]}})
+        };
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/carts",
+            json!({"carts": [cart(9), cart(8)]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/orders",
+            json!({"orders": [{"id": 1, "id_cart": 8}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/customers",
+            json!({"customers": [{"id": 2, "firstname": "John", "lastname": "DOE", "email": "pub@prestashop.com"}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/products",
+            json!({"products": [{"id": 6, "name": [{"id": 1, "value": "Mug"}], "pay": "14.400000"}]}),
+        );
+        let page = shop(&t)
+            .list_abandoned_carts(&CartQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let c = &page.items[0];
+        assert_eq!(
+            (c.id.as_str(), c.email.as_deref()),
+            ("9", Some("pub@prestashop.com"))
+        );
+        assert_eq!(c.total, Some(dec("28.8")));
+        assert_eq!(c.currency.as_deref(), Some("EUR"));
+        let carts = t
+            .requests()
+            .into_iter()
+            .find(|r| r.path() == "/es/api/carts")
+            .unwrap();
+        assert_eq!(
+            query(&carts, "filter[id_customer]").as_deref(),
+            Some("[1,999999999]")
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_requests_reuse_auth_and_send_xml() {
+        let t = Arc::new(FakeTransport::new());
+        t.on(
+            Method::Post,
+            "/es/api/carriers",
+            HttpResponse::new(201, r#"{"carrier":{"id":"7"}}"#),
+        );
+        let s = shop(&t);
+        let resp = s
+            .raw(&RawRequest {
+                method: "POST".into(),
+                path: "/carriers".into(),
+                body: Some(serde_json::Value::String(
+                    "<prestashop><carrier/></prestashop>".into(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (resp.status, resp.body["carrier"]["id"].clone()),
+            (201, json!("7"))
+        );
+        let req = &t.requests()[0];
+        assert_eq!(req.header_value("content-type"), Some("application/xml"));
+        assert_eq!(req.header_value("authorization"), Some("Basic S0VZOg=="));
+        assert_eq!(
+            req.body.as_deref(),
+            Some("<prestashop><carrier/></prestashop>")
+        );
+        let json_body = s
+            .raw(&RawRequest {
+                method: "POST".into(),
+                path: "/carriers".into(),
+                body: Some(json!({"carrier": {}})),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            json_body,
+            Err(ConnectorError::Api { status: 400, .. })
+        ));
     }
 }

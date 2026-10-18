@@ -6,9 +6,11 @@ pub(crate) enum Field {
     /// A multilang field. PrestaShop blanks any language left out, so every
     /// language is sent.
     Lang(Vec<(u64, String)>),
+    /// Already-built XML, such as `associations`.
+    Xml(String),
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -29,6 +31,7 @@ pub(crate) fn document(resource: &str, fields: &[(&str, Field)]) -> String {
     for (name, value) in fields {
         match value {
             Field::Text(v) => body.push_str(&format!("<{name}>{}</{name}>", escape(v))),
+            Field::Xml(inner) => body.push_str(&format!("<{name}>{inner}</{name}>")),
             Field::Lang(values) => {
                 body.push_str(&format!("<{name}>"));
                 for (id, v) in values {
@@ -43,9 +46,40 @@ pub(crate) fn document(resource: &str, fields: &[(&str, Field)]) -> String {
     )
 }
 
+/// `<{list}><{item}><k>v</k>...</{item}>...</{list}>`, e.g. the categories
+/// or cart rows inside `associations`.
+pub(crate) fn rows(list: &str, item: &str, rows: &[Vec<(&str, String)>]) -> String {
+    let mut out = format!("<{list}>");
+    for row in rows {
+        out.push_str(&format!("<{item}>"));
+        for (k, v) in row {
+            out.push_str(&format!("<{k}>{}</{k}>", escape(v)));
+        }
+        out.push_str(&format!("</{item}>"));
+    }
+    out.push_str(&format!("</{list}>"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn associations_nest_rows() {
+        let doc = document(
+            "product",
+            &[(
+                "associations",
+                Field::Xml(rows(
+                    "categories",
+                    "category",
+                    &[vec![("id", "2".into())], vec![("id", "10".into())]],
+                )),
+            )],
+        );
+        assert!(doc.contains("<associations><categories><category><id>2</id></category><category><id>10</id></category></categories></associations>"));
+    }
 
     #[test]
     fn documents_escape_values_and_nest_languages() {
