@@ -836,7 +836,7 @@ async fn abandoned_carts_are_active_carts_with_items_and_an_email() {
     );
     assert_eq!(cart.line_items[0].product_id.as_deref(), Some("MUG-1"));
     let req = &t.requests()[0];
-    let filters: Vec<(String, String)> = (0..4)
+    let filters: Vec<(String, String)> = (0..5)
         .map(|g| {
             let f = |k: &str| {
                 query(
@@ -854,8 +854,16 @@ async fn abandoned_carts_are_active_carts_with_items_and_an_email() {
             ("is_active".to_string(), "eq".to_string()),
             ("items_count".into(), "gt".into()),
             ("customer_email".into(), "notnull".into()),
+            ("updated_at".into(), "lteq".into()),
             ("updated_at".into(), "gteq".into())
         ]
+    );
+    let idle_since = query(req, "searchCriteria[filter_groups][3][filters][0][value]").unwrap();
+    let cutoff = chrono::NaiveDateTime::parse_from_str(&idle_since, "%Y-%m-%d %H:%M:%S").unwrap();
+    let age = chrono::Utc::now().naive_utc() - cutoff;
+    assert!(
+        (age - chrono::Duration::hours(2)).num_seconds().abs() < 60,
+        "carts must be idle for two hours: {idle_since}"
     );
 }
 

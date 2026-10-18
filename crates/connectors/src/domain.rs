@@ -422,6 +422,9 @@ pub struct CouponQuery {
     pub per_page: Option<u32>,
 }
 
+/// A cart counts as abandoned once untouched this long without becoming an order.
+pub const ABANDONED_AFTER_HOURS: i64 = 2;
+
 /// A cart or checkout that has items but did not become an order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbandonedCart {

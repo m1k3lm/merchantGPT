@@ -241,15 +241,25 @@ impl Magento {
         Ok(Value::Object(out))
     }
 
+    /// Abandoned means still active (never turned into an order), with
+    /// items and an email, and untouched for `ABANDONED_AFTER_HOURS`.
+    /// Magento keeps quote times in UTC.
     pub(super) async fn list_abandoned_carts_impl(
         &self,
         q: &CartQuery,
     ) -> Result<Page<AbandonedCart>, ConnectorError> {
+        let idle_since =
+            chrono::Utc::now().naive_utc() - chrono::Duration::hours(ABANDONED_AFTER_HOURS);
         let mut c = Self::criteria(q.page, q.per_page)
             .sort("updated_at", "DESC")
             .and(vec![Filter::eq("is_active", "1")])
             .and(vec![Filter::cond("items_count", "gt", "0")])
-            .and(vec![Filter::cond("customer_email", "notnull", "")]);
+            .and(vec![Filter::cond("customer_email", "notnull", "")])
+            .and(vec![Filter::cond(
+                "updated_at",
+                "lteq",
+                idle_since.format("%Y-%m-%d %H:%M:%S").to_string(),
+            )]);
         if let Some(since) = q.since {
             c = c.and(vec![Filter::cond(
                 "updated_at",
