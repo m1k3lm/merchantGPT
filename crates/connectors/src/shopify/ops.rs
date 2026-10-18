@@ -85,9 +85,7 @@ fn customer_gets(kind: &str, amount: Decimal) -> Result<Value, ConnectorError> {
 }
 
 impl Shopify {
-    /// Makes the product a member of exactly `wanted` collections. Shopify only
-    /// lets products be added to or removed from manual collections; smart
-    /// collections report an error.
+    /// Makes the product a member of exactly `wanted` collections.
     pub(super) async fn set_collections(
         &self,
         product_id: &Value,
@@ -99,24 +97,60 @@ impl Shopify {
             .map(|id| gid("Collection", id))
             .collect::<Result<_, _>>()?;
         for c in wanted.iter().filter(|c| !current.contains(c)) {
-            let data = self
-                .graphql(
-                    queries::COLLECTION_ADD,
-                    json!({"id": c, "productIds": [product_id]}),
-                )
-                .await?;
-            check_user_errors(&data["collectionAddProducts"], "userErrors")?;
+            self.change_membership(c, product_id, true).await?;
         }
         for c in current.iter().filter(|c| !wanted.contains(c)) {
-            let data = self
-                .graphql(
-                    queries::COLLECTION_REMOVE,
-                    json!({"id": c, "productIds": [product_id]}),
-                )
-                .await?;
-            check_user_errors(&data["collectionRemoveProducts"], "userErrors")?;
+            self.change_membership(c, product_id, false).await?;
         }
         Ok(())
+    }
+
+    /// Since 2026-07 a collection's hand-picked products are selections of
+    /// one of its conditions sources; `collectionAddProducts` and
+    /// `collectionRemoveProducts` are deprecated.
+    async fn change_membership(
+        &self,
+        collection: &str,
+        product_id: &Value,
+        add: bool,
+    ) -> Result<(), ConnectorError> {
+        let data = self
+            .graphql(queries::COLLECTION_SOURCES, json!({"id": collection}))
+            .await?;
+        if data["collection"].is_null() {
+            return Err(ConnectorError::NotFound(format!("collection {collection}")));
+        }
+        let source = data["collection"]["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["__typename"] == "CollectionConditionsSource")
+            .and_then(|s| s["id"].as_str());
+        let selection = json!([{"productId": product_id}]);
+        let mut change = match (source, add) {
+            (Some(id), true) => json!({"sourcesToUpdate": [{"condition": {
+                "id": id, "inclusion": {"selectionsToAdd": selection}
+            }}]}),
+            (Some(id), false) => json!({"sourcesToUpdate": [{"condition": {
+                "id": id, "inclusion": {"selectionsToRemove": selection}
+            }}]}),
+            (None, true) => json!({"sourcesToCreate": [{"source": {
+                "title": "Hand-picked products", "inclusion": {"selections": selection}
+            }}]}),
+            (None, false) => {
+                return Err(bad_request(format!(
+                    "collection {collection} takes its products from other collections; change those instead"
+                )))
+            }
+        };
+        change["id"] = json!(collection);
+        let data = self
+            .graphql(
+                queries::COLLECTION_SOURCES_UPDATE,
+                json!({"collection": change}),
+            )
+            .await?;
+        check_user_errors(&data["collectionUpdate"], "userErrors")
     }
 
     /// Creates the product with its single default variant, then sets the
@@ -870,8 +904,16 @@ mod tests {
             &t,
             json!({"productVariant": variant(1, 1, &[one, two], true)}),
         );
-        data(&t, json!({"collectionAddProducts": {"userErrors": []}}));
-        data(&t, json!({"collectionRemoveProducts": {"userErrors": []}}));
+        let source = |id: u64| {
+            json!({"collection": {"sources": [
+                {"__typename": "CollectionSubCollectionsSource"},
+                {"__typename": "CollectionConditionsSource", "id": format!("gid://shopify/CollectionConditionsSource/{id}")}
+            ]}})
+        };
+        data(&t, source(30));
+        data(&t, json!({"collectionUpdate": {"userErrors": []}}));
+        data(&t, source(10));
+        data(&t, json!({"collectionUpdate": {"userErrors": []}}));
         data(
             &t,
             json!({"productVariant": variant(1, 1, &[two, "gid://shopify/Collection/3"], true)}),
@@ -887,19 +929,51 @@ mod tests {
             .await
             .unwrap();
         let b = sent(&t);
-        assert!(b[1]["query"]
-            .as_str()
-            .unwrap()
-            .contains("collectionAddProducts"));
         assert_eq!(b[1]["variables"]["id"], "gid://shopify/Collection/3");
-        assert!(b[2]["query"]
+        assert_eq!(
+            b[2]["variables"]["collection"],
+            json!({"id": "gid://shopify/Collection/3", "sourcesToUpdate": [{"condition": {
+                "id": "gid://shopify/CollectionConditionsSource/30",
+                "inclusion": {"selectionsToAdd": [{"productId": "gid://shopify/Product/9"}]}
+            }}]})
+        );
+        assert_eq!(b[3]["variables"]["id"], one);
+        assert_eq!(
+            b[4]["variables"]["collection"]["sourcesToUpdate"][0]["condition"]["inclusion"],
+            json!({"selectionsToRemove": [{"productId": "gid://shopify/Product/9"}]})
+        );
+        assert!(b.iter().all(|q| !q["query"]
             .as_str()
             .unwrap()
-            .contains("collectionRemoveProducts"));
-        assert_eq!(b[2]["variables"]["id"], one);
+            .contains("collectionAddProducts")));
+    }
+
+    #[tokio::test]
+    async fn a_collection_without_a_source_gets_one_for_hand_picked_products() {
+        let t = Arc::new(FakeTransport::new());
+        data(&t, json!({"productVariant": variant(1, 1, &[], true)}));
+        data(&t, json!({"collection": {"sources": []}}));
+        data(&t, json!({"collectionUpdate": {"userErrors": []}}));
+        data(
+            &t,
+            json!({"productVariant": variant(1, 1, &["gid://shopify/Collection/5"], true)}),
+        );
+        shop(&t)
+            .update_product(
+                "11",
+                &ProductPatch {
+                    category_ids: Some(vec!["5".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            b[2]["variables"]["productIds"],
-            json!(["gid://shopify/Product/9"])
+            sent(&t)[2]["variables"]["collection"],
+            json!({"id": "gid://shopify/Collection/5", "sourcesToCreate": [{"source": {
+                "title": "Hand-picked products",
+                "inclusion": {"selections": [{"productId": "gid://shopify/Product/9"}]}
+            }}]})
         );
     }
 

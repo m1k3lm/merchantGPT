@@ -231,12 +231,13 @@ pub const COLLECTION_DELETE: &str = "mutation CollectionDelete($input: Collectio
   collectionDelete(input: $input) { deletedCollectionId userErrors { field message } }
 }";
 
-pub const COLLECTION_ADD: &str = "mutation CollectionAdd($id: ID!, $productIds: [ID!]!) {
-  collectionAddProducts(id: $id, productIds: $productIds) { userErrors { field message } }
+pub const COLLECTION_SOURCES: &str = "query CollectionSources($id: ID!) {
+  collection(id: $id) { sources { __typename ... on CollectionConditionsSource { id } } }
 }";
 
-pub const COLLECTION_REMOVE: &str = "mutation CollectionRemove($id: ID!, $productIds: [ID!]!) {
-  collectionRemoveProducts(id: $id, productIds: $productIds) { userErrors { field message } }
+pub const COLLECTION_SOURCES_UPDATE: &str =
+    "mutation CollectionSourcesUpdate($collection: CollectionUpdateInput!) {
+  collectionUpdate(collection: $collection) { userErrors { field message } }
 }";
 
 pub const PRODUCT_CREATE: &str = "mutation ProductCreate($product: ProductCreateInput!) {
