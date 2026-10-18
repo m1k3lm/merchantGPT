@@ -1,8 +1,15 @@
 //! Magento 2 REST connector. Authenticates with an integration access token as
-//! a bearer token. Reads use `/rest/V1`; product writes use `/rest/all/V1` so
-//! they apply to every store view instead of one view's overrides.
+//! a bearer token. Reads use `/rest/V1`; product and category writes use
+//! `/rest/all/V1` so they apply to every store view instead of one view's
+//! overrides.
 
+mod catalog;
+mod coupons;
 mod criteria;
+mod customers;
+#[cfg(test)]
+mod ops_tests;
+mod orders;
 mod types;
 
 use std::sync::Arc;
@@ -48,13 +55,29 @@ fn segment(s: &str) -> String {
 }
 
 fn order_id(id: &str) -> Result<&str, ConnectorError> {
+    numeric(id).ok_or_else(|| {
+        ConnectorError::NotFound(format!(
+            "{:?} is not a Magento order id (use the numeric id, not the order number)",
+            id.trim()
+        ))
+    })
+}
+
+fn numeric(id: &str) -> Option<&str> {
     let id = id.trim();
-    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
-        Ok(id)
-    } else {
-        Err(ConnectorError::NotFound(format!(
-            "{id:?} is not a Magento order id (use the numeric id, not the order number)"
-        )))
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+fn entity_id<'a>(kind: &str, id: &'a str) -> Result<&'a str, ConnectorError> {
+    numeric(id).ok_or_else(|| {
+        ConnectorError::NotFound(format!("{:?} is not a Magento {kind} id", id.trim()))
+    })
+}
+
+fn bad_request(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::Api {
+        status: 400,
+        message: message.into(),
     }
 }
 
@@ -136,6 +159,70 @@ impl Magento {
             .await
     }
 
+    /// A write under `/rest/{scope}V1`; `scope` is `""` or `"all/"`.
+    async fn write(
+        &self,
+        method: Method,
+        scope: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ConnectorError> {
+        self.send(method, self.url(scope, path, &[]), body).await
+    }
+
+    /// The writable fields of a patch as Magento's product object.
+    fn product_body(sku: &str, patch: &ProductPatch) -> Result<Map<String, Value>, ConnectorError> {
+        let mut product = Map::new();
+        product.insert("sku".into(), json!(sku));
+        if let Some(v) = &patch.name {
+            product.insert("name".into(), json!(v));
+        }
+        if let Some(v) = &patch.status {
+            product.insert("status".into(), json!(status_code(v)?));
+        }
+        if let Some(v) = &patch.regular_price {
+            product.insert("price".into(), number(v));
+        }
+        let mut custom = Vec::new();
+        if let Some(v) = &patch.sale_price {
+            custom.push(json!({"attribute_code": "special_price", "value": v.to_string()}));
+        }
+        if let Some(v) = &patch.description {
+            custom.push(json!({"attribute_code": "description", "value": v}));
+        }
+        if !custom.is_empty() {
+            product.insert("custom_attributes".into(), Value::Array(custom));
+        }
+        let mut ext = Map::new();
+        if let Some(q) = patch.stock_quantity {
+            ext.insert("stock_item".into(), json!({"qty": q, "is_in_stock": q > 0}));
+        }
+        if let Some(ids) = &patch.category_ids {
+            let links = ids
+                .iter()
+                .map(|id| {
+                    entity_id("category", id).map(|id| json!({"position": 0, "category_id": id}))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ext.insert("category_links".into(), Value::Array(links));
+        }
+        if !ext.is_empty() {
+            product.insert("extension_attributes".into(), Value::Object(ext));
+        }
+        Ok(product)
+    }
+
+    /// Website ids other than the admin website (0).
+    async fn website_ids(&self) -> Result<Vec<u64>, ConnectorError> {
+        let v = self.get("/store/websites", &[]).await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["id"].as_u64())
+            .filter(|id| *id != 0)
+            .collect())
+    }
+
     async fn list<T>(
         &self,
         path: &str,
@@ -193,6 +280,171 @@ impl ShopConnector for Magento {
         Platform::Magento
     }
 
+    /// Magento has no order delete in its REST API; orders are cancelled.
+    fn hidden(&self) -> &'static [&'static str] {
+        &["shop_manage_order:delete"]
+    }
+
+    fn api_hint(&self) -> &'static str {
+        "Magento 2 REST: path relative to /rest, e.g. /V1/products (default store view) or /all/V1/products (all store views); searchCriteria goes in query; JSON bodies."
+    }
+
+    async fn create_product(&self, p: &ProductPatch) -> Result<Product, ConnectorError> {
+        self.create_product_impl(p).await
+    }
+
+    async fn delete_product(&self, id: &str) -> Result<(), ConnectorError> {
+        self.write(
+            Method::Delete,
+            "",
+            &format!("/products/{}", segment(id)),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn list_categories(&self, q: &CategoryQuery) -> Result<Page<Category>, ConnectorError> {
+        self.list_categories_impl(q).await
+    }
+
+    async fn create_category(&self, c: &CategoryPatch) -> Result<Category, ConnectorError> {
+        self.create_category_impl(c).await
+    }
+
+    async fn update_category(
+        &self,
+        id: &str,
+        c: &CategoryPatch,
+    ) -> Result<Category, ConnectorError> {
+        self.update_category_impl(id, c).await
+    }
+
+    async fn delete_category(&self, id: &str) -> Result<(), ConnectorError> {
+        let id = entity_id("category", id)?;
+        self.write(Method::Delete, "", &format!("/categories/{id}"), None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn get_customer(&self, id: &str) -> Result<Customer, ConnectorError> {
+        types::customer(&self.customer_raw(id).await?)
+    }
+
+    async fn create_customer(&self, c: &CustomerPatch) -> Result<Customer, ConnectorError> {
+        self.create_customer_impl(c).await
+    }
+
+    async fn update_customer(
+        &self,
+        id: &str,
+        c: &CustomerPatch,
+    ) -> Result<Customer, ConnectorError> {
+        self.update_customer_impl(id, c).await
+    }
+
+    async fn delete_customer(&self, id: &str) -> Result<(), ConnectorError> {
+        let id = entity_id("customer", id)?;
+        self.write(Method::Delete, "", &format!("/customers/{id}"), None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn list_addresses(&self, customer_id: &str) -> Result<Vec<Address>, ConnectorError> {
+        let c = self.customer_raw(customer_id).await?;
+        c["addresses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(types::address)
+            .collect()
+    }
+
+    async fn create_address(
+        &self,
+        customer_id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.create_address_impl(customer_id, a).await
+    }
+
+    async fn update_address(
+        &self,
+        customer_id: &str,
+        id: &str,
+        a: &AddressPatch,
+    ) -> Result<Address, ConnectorError> {
+        self.update_address_impl(customer_id, id, a).await
+    }
+
+    async fn delete_address(&self, customer_id: &str, id: &str) -> Result<(), ConnectorError> {
+        self.delete_address_impl(customer_id, id).await
+    }
+
+    async fn create_order(&self, o: &NewOrder) -> Result<Order, ConnectorError> {
+        self.create_order_impl(o).await
+    }
+
+    /// With `notify_customer`, Magento emails the comment to the customer.
+    async fn add_order_note(&self, id: &str, note: &OrderNote) -> Result<(), ConnectorError> {
+        let id = order_id(id)?;
+        let notify = u8::from(note.notify_customer);
+        self.write(
+            Method::Post,
+            "",
+            &format!("/orders/{id}/comments"),
+            Some(json!({"statusHistory": {
+                "comment": note.note,
+                "is_customer_notified": notify,
+                "is_visible_on_front": notify
+            }})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn list_coupons(&self, q: &CouponQuery) -> Result<Page<Coupon>, ConnectorError> {
+        self.list_coupons_impl(q).await
+    }
+
+    async fn create_coupon(&self, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.create_coupon_impl(c).await
+    }
+
+    async fn update_coupon(&self, id: &str, c: &CouponPatch) -> Result<Coupon, ConnectorError> {
+        self.update_coupon_impl(id, c).await
+    }
+
+    async fn delete_coupon(&self, id: &str) -> Result<(), ConnectorError> {
+        self.delete_coupon_impl(id).await
+    }
+
+    async fn list_abandoned_carts(
+        &self,
+        q: &CartQuery,
+    ) -> Result<Page<AbandonedCart>, ConnectorError> {
+        self.list_abandoned_carts_impl(q).await
+    }
+
+    async fn raw(&self, req: &RawRequest) -> Result<RawResponse, ConnectorError> {
+        let method = match req.method.as_str() {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "PATCH" => Method::Patch,
+            "DELETE" => Method::Delete,
+            other => return Err(bad_request(format!("unsupported method {other}"))),
+        };
+        let path = format!("/{}", req.path.trim().trim_start_matches('/'));
+        let mut url = reqwest::Url::parse(&format!("{}/rest{path}", self.base))
+            .map_err(|e| bad_request(format!("bad path: {e}")))?;
+        if !req.query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&req.query);
+        }
+        let body = self.send(method, url.to_string(), req.body.clone()).await?;
+        Ok(RawResponse { status: 200, body })
+    }
+
     async fn verify(&self) -> Result<(), ConnectorError> {
         self.get("/products", &Criteria::page(1, 1).params())
             .await
@@ -229,29 +481,7 @@ impl ShopConnector for Magento {
                 message: "Magento identifies products by SKU; changing it is not supported".into(),
             });
         }
-        let mut product = Map::new();
-        product.insert("sku".into(), json!(sku));
-        if let Some(v) = &patch.name {
-            product.insert("name".into(), json!(v));
-        }
-        if let Some(v) = &patch.status {
-            product.insert("status".into(), json!(status_code(v)?));
-        }
-        if let Some(v) = &patch.regular_price {
-            product.insert("price".into(), number(v));
-        }
-        if let Some(v) = &patch.sale_price {
-            product.insert(
-                "custom_attributes".into(),
-                json!([{"attribute_code": "special_price", "value": v.to_string()}]),
-            );
-        }
-        if let Some(q) = patch.stock_quantity {
-            product.insert(
-                "extension_attributes".into(),
-                json!({"stock_item": {"qty": q, "is_in_stock": q > 0}}),
-            );
-        }
+        let product = Self::product_body(sku, patch)?;
         let url = self.url("all/", &format!("/products/{}", segment(sku)), &[]);
         let v = self
             .send(Method::Put, url, Some(json!({"product": product})))
