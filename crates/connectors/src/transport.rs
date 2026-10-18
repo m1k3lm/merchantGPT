@@ -137,6 +137,7 @@ pub struct ReqwestTransport {
     client: reqwest::Client,
     max_retries: u32,
     base_backoff: Duration,
+    timeout: Duration,
 }
 
 impl ReqwestTransport {
@@ -145,7 +146,14 @@ impl ReqwestTransport {
             client,
             max_retries: 3,
             base_backoff: Duration::from_millis(500),
+            // Magento order pages can take tens of seconds on large stores.
+            timeout: Duration::from_secs(60),
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn with_backoff(mut self, base: Duration, max_retries: u32) -> Self {
@@ -162,11 +170,7 @@ impl ReqwestTransport {
             Method::Patch => reqwest::Method::PATCH,
             Method::Delete => reqwest::Method::DELETE,
         };
-        let mut builder = self
-            .client
-            .request(method, &req.url)
-            // Magento order pages can take tens of seconds on large stores.
-            .timeout(Duration::from_secs(60));
+        let mut builder = self.client.request(method, &req.url).timeout(self.timeout);
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
@@ -186,6 +190,15 @@ impl ReqwestTransport {
             headers,
             body,
         })
+    }
+
+    fn error(&self, e: reqwest::Error) -> ConnectorError {
+        if e.is_timeout() {
+            ConnectorError::TimedOut(self.timeout.as_secs().max(1))
+        } else {
+            // Without_url keeps query-string credentials out of error text.
+            ConnectorError::Transport(describe(e))
+        }
     }
 
     fn backoff(&self, attempt: u32, retry_after: Option<&str>) -> Duration {
@@ -218,13 +231,14 @@ impl HttpTransport for ReqwestTransport {
             let result = self.send_once(&req).await;
             let transient = match &result {
                 Ok(r) => matches!(r.status, 429 | 502 | 503 | 504),
+                // A timeout is also `is_request`, so it is ruled out first.
+                Err(e) if e.is_timeout() => false,
                 // `is_request` covers a pooled connection the server already
                 // closed: nothing was processed, so a resend is safe here.
-                Err(e) => e.is_connect() || e.is_timeout() || e.is_request(),
+                Err(e) => e.is_connect() || e.is_request(),
             };
             if !(retryable && transient && attempt < self.max_retries) {
-                // Without_url keeps query-string credentials out of error text.
-                return result.map_err(|e| ConnectorError::Transport(describe(e)));
+                return result.map_err(|e| self.error(e));
             }
             let retry_after = result.as_ref().ok().and_then(|r| r.header("retry-after"));
             tokio::time::sleep(self.backoff(attempt, retry_after)).await;
@@ -361,6 +375,40 @@ mod tests {
             .to_string()
             .to_lowercase();
         assert!(refused.contains("refused"), "{refused}");
+    }
+
+    /// Accepts connections and never answers. Returns the address and the
+    /// accept counter.
+    fn silent_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming() {
+                c.fetch_add(1, Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        (format!("http://{addr}/rest/V1/orders"), count)
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_read_is_not_resent_and_says_the_shop_was_slow() {
+        use std::sync::atomic::Ordering;
+        let t = ReqwestTransport::default()
+            .with_backoff(Duration::from_millis(1), 2)
+            .with_timeout(Duration::from_millis(200));
+        let (url, count) = silent_server();
+        let err = t
+            .send(HttpRequest::new(Method::Get, &url))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::TimedOut(1)), "{err:?}");
+        assert!(err.to_string().contains("did not answer within 1 s"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

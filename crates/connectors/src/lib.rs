@@ -124,6 +124,10 @@ pub enum ConnectorError {
     InvalidResponse(String),
     #[error("could not reach the shop: {0}")]
     Transport(String),
+    /// The request reached the server but no answer came within this many
+    /// seconds. Never retried: a server that slow stays slow.
+    #[error("the shop did not answer within {0} s; ask for less data (a smaller page or fewer fields) or try again later")]
+    TimedOut(u64),
     /// A service other than the shop could not be reached; the message names it.
     #[error("{0}")]
     Unreachable(String),

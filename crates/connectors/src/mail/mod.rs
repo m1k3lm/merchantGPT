@@ -140,6 +140,11 @@ pub async fn call(
                 "could not reach {service}: {e}"
             )))
         }
+        Err(ConnectorError::TimedOut(secs)) => {
+            return Err(ConnectorError::Unreachable(format!(
+                "{service} did not answer within {secs} s"
+            )))
+        }
         Err(e) => return Err(e),
     };
     if !resp.is_success() {
@@ -205,6 +210,35 @@ pub fn check_contacts(contacts: &[Contact]) -> Result<(), ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HttpResponse;
+
+    struct Failing(fn() -> ConnectorError);
+
+    #[async_trait::async_trait]
+    impl HttpTransport for Failing {
+        async fn send(&self, _: HttpRequest) -> Result<HttpResponse, ConnectorError> {
+            Err((self.0)())
+        }
+    }
+
+    #[tokio::test]
+    async fn network_failures_name_the_service_not_the_shop() {
+        let req = || HttpRequest::new(crate::transport::Method::Get, "https://api.brevo.com/v3/x");
+        let down = call(
+            &Failing(|| ConnectorError::Transport("refused".into())),
+            "Brevo",
+            req(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(down, "could not reach Brevo: refused");
+        let slow = call(&Failing(|| ConnectorError::TimedOut(60)), "Brevo", req())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(slow, "Brevo did not answer within 60 s");
+    }
 
     #[test]
     fn marketing_needs_confirmed_consent() {
