@@ -393,3 +393,69 @@ async fn live_store_writes_every_entity() {
         Err(ConnectorError::NotFound(_))
     ));
 }
+
+/// Adds one processing order shipped to Madrid and deletes it afterwards.
+#[tokio::test]
+#[ignore = "needs a live WooCommerce store"]
+async fn sales_by_location_counts_the_reports_orders() {
+    let woo = client().await;
+    let hoodie = woo
+        .list_products(&ProductQuery {
+            search: Some("blue hoodie".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .items
+        .remove(0);
+    let address = |state: &str| AddressPatch {
+        first_name: Some("Ana".into()),
+        last_name: Some("Test".into()),
+        address1: Some("Gran Via 1".into()),
+        city: Some("Madrid".into()),
+        postcode: Some("28013".into()),
+        state: Some(state.into()),
+        country: Some("ES".into()),
+        ..Default::default()
+    };
+    let order = woo
+        .create_order(&NewOrder {
+            email: Some("ana-location@example.com".into()),
+            line_items: vec![NewLineItem {
+                product_id: hoodie.id.clone(),
+                quantity: 1,
+                price: None,
+            }],
+            billing: Some(address("B")),
+            shipping: Some(address("M")),
+            status: Some("processing".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // The store's day may differ from this computer's around midnight.
+    let today = Local::now().date_naive();
+    let range = DateRange {
+        from: today - chrono::Days::new(1),
+        to: today + chrono::Days::new(1),
+    };
+    let report = woo.sales_report(&range).await.unwrap();
+    let places = woo.sales_by_location(&range).await;
+    woo.delete_order(&order.id).await.unwrap();
+    let places = places.unwrap();
+    println!("live places: {places:?}");
+    let madrid = places
+        .rows
+        .iter()
+        .find(|r| r.country == "ES" && r.region.as_deref() == Some("M"))
+        .expect("the shipping address decides the place");
+    assert!(madrid.total_sales >= order.total);
+    assert_eq!(
+        places.rows.iter().map(|r| r.orders).sum::<u64>(),
+        report.orders
+    );
+    assert_eq!(
+        places.rows.iter().map(|r| r.total_sales).sum::<Decimal>(),
+        report.total_sales
+    );
+}

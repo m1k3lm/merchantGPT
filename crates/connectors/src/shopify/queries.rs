@@ -108,6 +108,18 @@ pub const REPORT: &str = "query Report($after: String, $query: String) {
   }
 }";
 
+pub const REPORT_LOCATIONS: &str = "query ReportLocations($after: String, $query: String) {
+  orders(first: 100, after: $after, query: $query, sortKey: CREATED_AT) {
+    nodes {
+      cancelledAt
+      totalPriceSet { shopMoney { amount currencyCode } }
+      shippingAddress { countryCodeV2 province }
+      billingAddress { countryCodeV2 province }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}";
+
 const CUSTOMER: &str = "fragment C on Customer {
   id firstName lastName numberOfOrders
   defaultEmailAddress { emailAddress marketingState }

@@ -490,3 +490,45 @@ async fn creates_changes_and_deletes_records_on_a_live_store() {
         Err(ConnectorError::NotFound(_))
     ));
 }
+
+/// Demo orders are unpaid, so one is moved to a paid status and back.
+#[tokio::test]
+#[ignore = "needs a live PrestaShop store"]
+async fn sales_by_location_counts_the_reports_orders() {
+    let creds = Credentials::from([(WEBSERVICE_KEY.into(), env("PRESTA_KEY"))]);
+    let shop = PrestaShop::new(
+        &env("PRESTA_URL"),
+        &creds,
+        Arc::new(ReqwestTransport::default()),
+    );
+    let order = shop
+        .list_orders(&OrderQuery::default())
+        .await
+        .unwrap()
+        .items
+        .remove(0);
+    shop.update_order_status(&order.id, "Payment accepted")
+        .await
+        .unwrap();
+    let range = DateRange {
+        from: chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+        to: Local::now().date_naive(),
+    };
+    let report = shop.sales_report(&range).await;
+    let places = shop.sales_by_location(&range).await;
+    shop.update_order_status(&order.id, &order.status)
+        .await
+        .unwrap();
+    let (report, places) = (report.unwrap(), places.unwrap());
+    println!("live places: {places:?}");
+    assert!(report.orders >= 1, "{report:?}");
+    assert!(places.rows.iter().all(|r| r.country != UNKNOWN_COUNTRY));
+    assert_eq!(
+        places.rows.iter().map(|r| r.orders).sum::<u64>(),
+        report.orders
+    );
+    assert_eq!(
+        places.rows.iter().map(|r| r.total_sales).sum::<Decimal>(),
+        report.total_sales
+    );
+}

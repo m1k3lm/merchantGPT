@@ -104,6 +104,7 @@ Requested after the four shop connectors existed: create, modify and delete orde
   - Mutate: `shop_manage_product`, `shop_manage_category`, `shop_manage_customer`, `shop_manage_address`, `shop_manage_coupon`, `shop_manage_order` (`create` | `update_status` | `add_note` | `delete`), `shop_api_write`. They replace `shop_update_product` and `shop_update_order_status`.
   - Raw API: REST platforms take `method`, `path` relative to the API root (no scheme, host or `..`), `query`, `body`; Shopify takes a GraphQL document and variables, and `shop_api_get` refuses a `mutation`. Responses are capped.
 - The confirmation card marks a `delete` action or a raw `DELETE` as irreversible.
+- `shop_sales_report` takes an optional `group_by` (`country` | `region`) backed by `ShopConnector::sales_by_location`: orders and gross sales per shipping country and region over the same orders as the plain report, so per-place questions never page full orders through the raw API (a Magento store took over 60 s for 200 full orders, and the raw output cap would have cut them anyway). A request that times out is not resent.
 
 ## Per platform (verify every endpoint against current docs or the live store; nothing from memory)
 

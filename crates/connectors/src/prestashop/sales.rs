@@ -21,6 +21,9 @@ const NO_LIMIT: &str = "999999";
 const FAR_FUTURE: &str = "2099-12-31 23:59:59";
 const MANUAL_PAYMENT: &str = "Manual order (merchantGPT)";
 
+/// Addresses asked for per request, keeping the `filter[id]` URL short.
+const ADDRESS_CHUNK: usize = 100;
+
 /// `"12"` or `"12:34"` (product 12, combination 34).
 fn product_ref(id: &str) -> Result<(String, String), ConnectorError> {
     let (p, c) = id.trim().split_once(':').unwrap_or((id.trim(), "0"));
@@ -651,5 +654,81 @@ impl PrestaShop {
             status: resp.status,
             body,
         })
+    }
+}
+
+impl PrestaShop {
+    /// Orders carry only an address id, so their delivery addresses are read
+    /// in chunks and their country and state ids resolved afterwards.
+    pub(super) async fn location_report(
+        &self,
+        range: &DateRange,
+    ) -> Result<LocationReport, ConnectorError> {
+        let meta = self.meta().await?;
+        let mut orders = Vec::new();
+        self.report_orders(
+            range,
+            "[id,total_paid_tax_incl,id_currency,id_address_delivery]",
+            |o| {
+                orders.push((
+                    types::string(&o["id_address_delivery"]),
+                    types::decimal(&o["total_paid_tax_incl"])?.unwrap_or_default(),
+                    types::string(&o["id_currency"]),
+                ));
+                Ok(())
+            },
+        )
+        .await?;
+        let wanted: Vec<String> = orders
+            .iter()
+            .filter_map(|(a, _, _)| a.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut addresses = Vec::new();
+        for chunk in wanted.chunks(ADDRESS_CHUNK) {
+            let v = self
+                .get(
+                    "addresses",
+                    vec![
+                        ("display".into(), "[id,id_country,id_state]".into()),
+                        ("filter[id]".into(), one_of(chunk.iter().cloned())),
+                    ],
+                )
+                .await?;
+            addresses.extend(list(&v, "addresses"));
+        }
+        let places = self.places_by(&addresses, "name").await;
+        let place = |map: &HashMap<String, String>, row: &Value, key: &str| {
+            types::string(&row[key])
+                .filter(|id| id != "0")
+                .map(|id| map.get(&id).cloned().unwrap_or(id))
+        };
+        let by_id: HashMap<String, (Option<String>, Option<String>)> = addresses
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    types::string(&a["id"])?,
+                    (
+                        place(&places.countries, a, "id_country"),
+                        place(&places.states, a, "id_state"),
+                    ),
+                ))
+            })
+            .collect();
+        let mut tally = LocationTally::default();
+        for (address, total, currency) in orders {
+            let (country, region) = address
+                .and_then(|a| by_id.get(&a).cloned())
+                .unwrap_or_default();
+            let currency = currency.map(|c| meta.currencies.get(&c).cloned().unwrap_or(c));
+            tally.add(
+                country.as_deref(),
+                region.as_deref(),
+                total,
+                currency.as_deref(),
+            );
+        }
+        Ok(tally.finish(range))
     }
 }

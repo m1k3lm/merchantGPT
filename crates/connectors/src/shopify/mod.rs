@@ -877,6 +877,62 @@ impl ShopConnector for Shopify {
     /// Sums the range's orders, skipping cancelled ones. Net sales are the
     /// current subtotals: after discounts, returns and edits, before shipping.
     async fn sales_report(&self, range: &DateRange) -> Result<SalesReport, ConnectorError> {
+        let mut report = SalesReport {
+            from: range.from,
+            to: range.to,
+            total_sales: Decimal::ZERO,
+            net_sales: Decimal::ZERO,
+            orders: 0,
+            items: 0,
+            currency: None,
+        };
+        self.report_orders(range, queries::REPORT, |o| {
+            let money = &o["totalPriceSet"]["shopMoney"];
+            report.total_sales += types::decimal(&money["amount"])?.unwrap_or_default();
+            report.net_sales +=
+                types::decimal(&o["currentSubtotalPriceSet"]["shopMoney"]["amount"])?
+                    .unwrap_or_default();
+            report.items += o["currentSubtotalLineItemsQuantity"].as_u64().unwrap_or(0);
+            report.orders += 1;
+            if report.currency.is_none() {
+                report.currency = money["currencyCode"].as_str().map(str::to_string);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(report)
+    }
+
+    async fn sales_by_location(&self, range: &DateRange) -> Result<LocationReport, ConnectorError> {
+        let mut tally = LocationTally::default();
+        self.report_orders(range, queries::REPORT_LOCATIONS, |o| {
+            let address = [&o["shippingAddress"], &o["billingAddress"]]
+                .into_iter()
+                .find(|a| a["countryCodeV2"].is_string())
+                .unwrap_or(&Value::Null);
+            let money = &o["totalPriceSet"]["shopMoney"];
+            tally.add(
+                address["countryCodeV2"].as_str(),
+                address["province"].as_str(),
+                types::decimal(&money["amount"])?.unwrap_or_default(),
+                money["currencyCode"].as_str(),
+            );
+            Ok(())
+        })
+        .await?;
+        Ok(tally.finish(range))
+    }
+}
+
+impl Shopify {
+    /// Walks the range's orders with `document`, skipping cancelled ones, and
+    /// refuses ranges over `MAX_REPORT_ORDERS`.
+    async fn report_orders(
+        &self,
+        range: &DateRange,
+        document: &str,
+        mut each: impl FnMut(&Value) -> Result<(), ConnectorError> + Send,
+    ) -> Result<(), ConnectorError> {
         if range.to < range.from {
             return Err(bad_request("`to` is before `from`"));
         }
@@ -895,42 +951,22 @@ impl ShopConnector for Shopify {
                 "{count} orders in this range; ask for a shorter range (at most {MAX_REPORT_ORDERS} orders)"
             )));
         }
-        let mut report = SalesReport {
-            from: range.from,
-            to: range.to,
-            total_sales: Decimal::ZERO,
-            net_sales: Decimal::ZERO,
-            orders: 0,
-            items: 0,
-            currency: None,
-        };
         let mut after: Option<String> = None;
         loop {
             let data = self
-                .graphql(queries::REPORT, json!({"after": after, "query": query}))
+                .graphql(document, json!({"after": after, "query": query}))
                 .await?;
             let orders = &data["orders"];
             for o in orders["nodes"].as_array().into_iter().flatten() {
-                if !o["cancelledAt"].is_null() {
-                    continue;
-                }
-                let money = &o["totalPriceSet"]["shopMoney"];
-                report.total_sales += types::decimal(&money["amount"])?.unwrap_or_default();
-                report.net_sales +=
-                    types::decimal(&o["currentSubtotalPriceSet"]["shopMoney"]["amount"])?
-                        .unwrap_or_default();
-                report.items += o["currentSubtotalLineItemsQuantity"].as_u64().unwrap_or(0);
-                report.orders += 1;
-                if report.currency.is_none() {
-                    report.currency = money["currencyCode"].as_str().map(str::to_string);
+                if o["cancelledAt"].is_null() {
+                    each(o)?;
                 }
             }
             if orders["pageInfo"]["hasNextPage"] != true {
-                break;
+                return Ok(());
             }
             after = orders["pageInfo"]["endCursor"].as_str().map(str::to_string);
         }
-        Ok(report)
     }
 }
 
@@ -1420,6 +1456,61 @@ mod tests {
             "created_at:>=2026-10-01 created_at:<2026-10-17"
         );
         assert_eq!(b[2]["variables"]["after"], "c1");
+    }
+
+    #[tokio::test]
+    async fn sales_by_location_uses_shipping_then_billing_and_skips_cancelled() {
+        let t = Arc::new(FakeTransport::new());
+        let address =
+            |country: &str, province: &str| json!({"countryCodeV2": country, "province": province});
+        let node = |total: &str, shipping: Value, billing: Value, cancelled: bool| {
+            json!({
+                "cancelledAt": if cancelled { json!("2026-10-02T00:00:00Z") } else { Value::Null },
+                "totalPriceSet": {"shopMoney": {"amount": total, "currencyCode": "EUR"}},
+                "shippingAddress": shipping,
+                "billingAddress": billing
+            })
+        };
+        data(&t, json!({"ordersCount": {"count": 4}}));
+        data(
+            &t,
+            json!({"orders": {"nodes": [
+                node("100.00", address("ES", "Madrid"), address("ES", "Sevilla"), false),
+                node("40.00", Value::Null, address("ES", "Sevilla"), false),
+                node("999.00", address("ES", "Madrid"), Value::Null, true),
+                node("7.00", Value::Null, Value::Null, false)
+            ], "pageInfo": {"hasNextPage": false}}}),
+        );
+        let r = token_shop(&t)
+            .sales_by_location(&DateRange {
+                from: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                to: NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+            })
+            .await
+            .unwrap();
+        let rows: Vec<_> = r
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.country.as_str(),
+                    r.region.as_deref(),
+                    r.orders,
+                    r.total_sales,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ES", Some("Madrid"), 1, dec("100")),
+                ("ES", Some("Sevilla"), 1, dec("40")),
+                ("unknown", None, 1, dec("7")),
+            ]
+        );
+        assert_eq!(r.currency.as_deref(), Some("EUR"));
+        let b = sent(&t);
+        assert!(b[1]["query"].as_str().unwrap().contains("shippingAddress"));
     }
 
     #[tokio::test]

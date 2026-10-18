@@ -16,6 +16,9 @@ use crate::ShopConnector;
 /// Raw API responses beyond this are cut, so one call cannot flood the context.
 const RAW_OUTPUT_LIMIT: usize = 20_000;
 
+/// Location rows beyond this are summed into one "other" row.
+const LOCATION_ROW_LIMIT: usize = 100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShopOp {
     ListProducts,
@@ -254,11 +257,12 @@ impl ShopTool {
                 Read,
             ),
             ShopOp::SalesReport => (
-                "Sales totals (gross, net, orders, items) for a date range.".into(),
+                "Sales totals (gross, net, orders, items) for a date range, or with `group_by` the number of orders and gross sales per country or per region (province/state), by shipping address. Use it for any per-country or per-province question instead of reading orders one by one.".into(),
                 object(
                     json!({
                         "from": {"type": "string", "format": "date", "description": "YYYY-MM-DD, inclusive"},
-                        "to": {"type": "string", "format": "date", "description": "YYYY-MM-DD, inclusive"}
+                        "to": {"type": "string", "format": "date", "description": "YYYY-MM-DD, inclusive"},
+                        "group_by": {"type": "string", "enum": ["country", "region"], "description": "Break down by country, or by country and region"}
                     }),
                     json!({}),
                     &["from", "to"],
@@ -430,6 +434,59 @@ struct ManageOrderArgs {
     order: NewOrder,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GroupBy {
+    Country,
+    Region,
+}
+
+#[derive(Deserialize)]
+struct SalesArgs {
+    #[serde(flatten)]
+    range: DateRange,
+    #[serde(default)]
+    group_by: Option<GroupBy>,
+}
+
+fn by_location(report: LocationReport, by: GroupBy) -> Value {
+    let mut rows = report.rows;
+    if by == GroupBy::Country {
+        let mut countries: Vec<LocationSales> = Vec::new();
+        for r in rows {
+            match countries.iter_mut().find(|c| c.country == r.country) {
+                Some(c) => {
+                    c.orders += r.orders;
+                    c.total_sales += r.total_sales;
+                }
+                None => countries.push(LocationSales { region: None, ..r }),
+            }
+        }
+        countries.sort_by_key(|r| std::cmp::Reverse(r.total_sales));
+        rows = countries;
+    }
+    let orders: u64 = rows.iter().map(|r| r.orders).sum();
+    let total_sales: rust_decimal::Decimal = rows.iter().map(|r| r.total_sales).sum();
+    if rows.len() > LOCATION_ROW_LIMIT {
+        let rest = rows.split_off(LOCATION_ROW_LIMIT - 1);
+        rows.push(LocationSales {
+            country: format!("other ({} places)", rest.len()),
+            region: None,
+            orders: rest.iter().map(|r| r.orders).sum(),
+            total_sales: rest.iter().map(|r| r.total_sales).sum(),
+        });
+    }
+    json!({
+        "from": report.from,
+        "to": report.to,
+        "currency": report.currency,
+        "group_by": if by == GroupBy::Country { "country" } else { "region" },
+        "orders": orders,
+        "total_sales": total_sales,
+        "rows": rows,
+    })
+}
+
 fn to_json<T: Serialize>(v: T) -> Result<String, ToolError> {
     serde_json::to_string(&v).map_err(|e| ToolError::Failed(e.to_string()))
 }
@@ -539,8 +596,11 @@ impl Tool for ShopTool {
                 to_json(shop.list_abandoned_carts(&parse_args(args)?).await?)
             }
             ShopOp::SalesReport => {
-                let r: DateRange = parse_args(args)?;
-                to_json(shop.sales_report(&r).await?)
+                let a: SalesArgs = parse_args(args)?;
+                match a.group_by {
+                    None => to_json(shop.sales_report(&a.range).await?),
+                    Some(by) => to_json(by_location(shop.sales_by_location(&a.range).await?, by)),
+                }
             }
             ShopOp::ApiGet => {
                 let mut req: RawRequest = parse_args(args)?;
@@ -769,6 +829,24 @@ mod tests {
         async fn sales_report(&self, _: &DateRange) -> Result<SalesReport, ConnectorError> {
             unimplemented!()
         }
+        async fn sales_by_location(
+            &self,
+            range: &DateRange,
+        ) -> Result<LocationReport, ConnectorError> {
+            let mut tally = LocationTally::default();
+            let eur = Some("EUR");
+            for (country, region, total, n) in [
+                (Some("ES"), Some("Madrid"), "100.50", 2),
+                (Some("ES"), Some("Barcelona"), "80", 1),
+                (Some("PT"), None, "120", 1),
+                (None, None, "5", 1),
+            ] {
+                for _ in 0..n {
+                    tally.add(country, region, total.parse().unwrap(), eur);
+                }
+            }
+            Ok(tally.finish(range))
+        }
         async fn delete_category(&self, _: &str) -> Result<(), ConnectorError> {
             Ok(())
         }
@@ -788,6 +866,57 @@ mod tests {
         });
         let tools = shop_tools(shop.clone());
         (shop, tools)
+    }
+
+    #[tokio::test]
+    async fn sales_report_breaks_down_by_region_or_by_country() {
+        let (_, tools) = picky(json!({}));
+        let report = find(&tools, "shop_sales_report");
+        let call = |by: &str| {
+            let (report, args) = (
+                report.clone(),
+                json!({"from": "2026-10-01", "to": "2026-10-18", "group_by": by}),
+            );
+            async move { report.call(args, &ToolContext::default()).await }
+        };
+        let regions: Value = serde_json::from_str(&call("region").await.unwrap()).unwrap();
+        assert_eq!(regions["orders"], 5);
+        assert_eq!(regions["total_sales"], "406.00");
+        assert_eq!(regions["currency"], "EUR");
+        assert_eq!(regions["rows"][0]["region"], "Madrid");
+        assert_eq!(regions["rows"][0]["orders"], 2);
+        assert_eq!(regions["rows"][0]["total_sales"], "201.00");
+        assert_eq!(regions["rows"][3]["country"], "unknown");
+
+        let countries: Value = serde_json::from_str(&call("country").await.unwrap()).unwrap();
+        let rows = countries["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            json!({"country": "ES", "orders": 3, "total_sales": "281.00"})
+        );
+        assert_eq!(rows[1]["country"], "PT");
+        assert_eq!(countries["total_sales"], "406.00");
+
+        assert!(call("city").await.is_err());
+    }
+
+    #[test]
+    fn many_places_end_in_one_other_row() {
+        let mut tally = LocationTally::default();
+        for i in 0..150 {
+            tally.add(Some("ES"), Some(&format!("r{i:03}")), (i + 1).into(), None);
+        }
+        let range = DateRange {
+            from: "2026-10-01".parse().unwrap(),
+            to: "2026-10-01".parse().unwrap(),
+        };
+        let v = by_location(tally.finish(&range), GroupBy::Region);
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), LOCATION_ROW_LIMIT);
+        assert_eq!(rows[0]["region"], "r149");
+        assert_eq!(rows[LOCATION_ROW_LIMIT - 1]["country"], "other (51 places)");
+        assert_eq!(v["orders"], 150);
     }
 
     #[test]

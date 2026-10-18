@@ -123,6 +123,15 @@ pub trait ShopConnector: Send + Sync {
         Err(unsupported(self.platform(), "deleting coupons"))
     }
 
+    /// Orders and gross sales per country and region, counting the same
+    /// orders as `sales_report`.
+    async fn sales_by_location(
+        &self,
+        _range: &DateRange,
+    ) -> Result<LocationReport, ConnectorError> {
+        Err(unsupported(self.platform(), "sales by location"))
+    }
+
     async fn list_abandoned_carts(
         &self,
         _q: &CartQuery,

@@ -19,6 +19,7 @@ use types::{WooCategory, WooCoupon, WooCustomer, WooOrder, WooProduct, WooSalesR
 
 const DEFAULT_PER_PAGE: u32 = 10;
 const MAX_PER_PAGE: u32 = 100;
+const MAX_REPORT_ORDERS: u64 = 5_000;
 
 pub struct WooCommerce {
     api: String,
@@ -488,6 +489,86 @@ impl ShopConnector for WooCommerce {
             .into_report(range)
     }
 
+    /// `/reports/sales` has no places, so this pages completed, processing
+    /// and on-hold orders, asking only for totals and addresses. That report
+    /// also nets out refunds, so with refunds the two totals can differ.
+    /// Dates are the store's local time, as in that report.
+    async fn sales_by_location(&self, range: &DateRange) -> Result<LocationReport, ConnectorError> {
+        if range.to < range.from {
+            return Err(ConnectorError::Api {
+                status: 400,
+                message: "`to` is before `from`".into(),
+            });
+        }
+        let out_of_range = || ConnectorError::Api {
+            status: 400,
+            message: "date out of range".into(),
+        };
+        // `after` and `before` are exclusive.
+        let after = range
+            .from
+            .checked_sub_days(Days::new(1))
+            .ok_or_else(out_of_range)?;
+        let before = range
+            .to
+            .checked_add_days(Days::new(1))
+            .ok_or_else(out_of_range)?;
+        let mut tally = LocationTally::default();
+        let mut page = 1u32;
+        loop {
+            let (orders, resp): (Vec<Value>, _) = self
+                .get(
+                    "/orders",
+                    vec![
+                        ("after".into(), format!("{after}T23:59:59")),
+                        ("before".into(), format!("{before}T00:00:00")),
+                        ("status".into(), "completed,processing,on-hold".into()),
+                        (
+                            "_fields".into(),
+                            "id,total,currency,shipping,billing".into(),
+                        ),
+                        ("orderby".into(), "id".into()),
+                        ("order".into(), "asc".into()),
+                        ("per_page".into(), MAX_PER_PAGE.to_string()),
+                        ("page".into(), page.to_string()),
+                    ],
+                )
+                .await?;
+            let total: u64 = resp
+                .header("x-wp-total")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if total > MAX_REPORT_ORDERS {
+                return Err(ConnectorError::Api {
+                    status: 400,
+                    message: format!(
+                        "{total} orders in this range; ask for a shorter range (at most {MAX_REPORT_ORDERS} orders)"
+                    ),
+                });
+            }
+            for o in &orders {
+                let address = [&o["shipping"], &o["billing"]]
+                    .into_iter()
+                    .find(|a| a["country"].as_str().is_some_and(|c| !c.is_empty()))
+                    .unwrap_or(&Value::Null);
+                tally.add(
+                    address["country"].as_str(),
+                    address["state"].as_str(),
+                    types::money(o["total"].as_str())?.unwrap_or_default(),
+                    o["currency"].as_str(),
+                );
+            }
+            let pages: u32 = resp
+                .header("x-wp-totalpages")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            if orders.is_empty() || page >= pages {
+                return Ok(tally.finish(range));
+            }
+            page += 1;
+        }
+    }
+
     /// WooCommerce core keeps no record of carts that did not become orders.
     fn hidden(&self) -> &'static [&'static str] {
         &["shop_list_abandoned_carts"]
@@ -948,6 +1029,69 @@ mod tests {
         assert_eq!((r.orders, r.items), (17, 31));
         let q = t.requests()[0].query_pairs();
         assert!(q.contains(&("date_min".into(), "2026-10-01".into())));
+    }
+
+    #[tokio::test]
+    async fn sales_by_location_pages_orders_by_shipping_then_billing_address() {
+        let t = Arc::new(FakeTransport::new());
+        let place = |country: &str, state: &str| json!({"country": country, "state": state});
+        let order = |total: &str, shipping: Value, billing: Value| json!({"id": 1, "total": total, "currency": "EUR", "shipping": shipping, "billing": billing});
+        let page1: Vec<_> = (0..MAX_PER_PAGE)
+            .map(|_| order("10.00", place("ES", "M"), place("ES", "B")))
+            .collect();
+        t.on(
+            Method::Get,
+            "/wp-json/wc/v3/orders",
+            HttpResponse::new(200, json!(page1).to_string())
+                .with_header("X-WP-Total", "102")
+                .with_header("X-WP-TotalPages", "2"),
+        )
+        .on(
+            Method::Get,
+            "/wp-json/wc/v3/orders",
+            HttpResponse::new(
+                200,
+                json!([
+                    order("5.50", place("", ""), place("ES", "B")),
+                    order("1.00", place("", ""), place("", ""))
+                ])
+                .to_string(),
+            )
+            .with_header("X-WP-Total", "102")
+            .with_header("X-WP-TotalPages", "2"),
+        );
+        let range = DateRange {
+            from: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+        };
+        let r = woo(&t).sales_by_location(&range).await.unwrap();
+        let rows: Vec<_> = r
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.country.as_str(),
+                    r.region.as_deref(),
+                    r.orders,
+                    r.total_sales,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ES", Some("M"), 100, dec("1000")),
+                ("ES", Some("B"), 1, dec("5.5")),
+                ("unknown", None, 1, dec("1")),
+            ]
+        );
+        let reqs = t.requests();
+        assert_eq!(reqs.len(), 2);
+        let q = reqs[0].query_pairs();
+        assert!(q.contains(&("after".into(), "2026-09-30T23:59:59".into())));
+        assert!(q.contains(&("before".into(), "2026-10-17T00:00:00".into())));
+        assert!(q.contains(&("status".into(), "completed,processing,on-hold".into())));
+        assert!(reqs[1].query_pairs().contains(&("page".into(), "2".into())));
     }
 
     #[tokio::test]

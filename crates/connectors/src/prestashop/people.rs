@@ -153,6 +153,12 @@ impl PrestaShop {
     }
 
     async fn places(&self, raw: &[Value]) -> types::Places {
+        self.places_by(raw, "iso_code").await
+    }
+
+    /// Country ISO codes and each state's `state_field` (`iso_code` or `name`)
+    /// for the ids in address rows.
+    pub(super) async fn places_by(&self, raw: &[Value], state_field: &str) -> types::Places {
         let ids = |k: &str| -> BTreeSet<String> {
             raw.iter()
                 .filter_map(|a| types::string(&a[k]))
@@ -160,23 +166,23 @@ impl PrestaShop {
                 .collect()
         };
         let mut places = types::Places::default();
-        for (resource, key, map) in [
-            ("countries", "id_country", &mut places.countries),
-            ("states", "id_state", &mut places.states),
+        for (resource, key, field, map) in [
+            ("countries", "id_country", "iso_code", &mut places.countries),
+            ("states", "id_state", state_field, &mut places.states),
         ] {
             let wanted = ids(key);
             if wanted.is_empty() {
                 continue;
             }
             let params = vec![
-                ("display".into(), "[id,iso_code]".into()),
+                ("display".into(), format!("[id,{field}]")),
                 ("filter[id]".into(), one_of(wanted)),
             ];
             // Without access the ids are shown instead of ISO codes.
             if let Ok(v) = self.get(resource, params).await {
                 for row in list(&v, resource) {
                     if let (Some(id), Some(iso)) =
-                        (types::string(&row["id"]), types::string(&row["iso_code"]))
+                        (types::string(&row["id"]), types::string(&row[field]))
                     {
                         map.insert(id, iso);
                     }

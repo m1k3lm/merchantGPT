@@ -195,6 +195,89 @@ pub struct SalesReport {
     pub currency: Option<String>,
 }
 
+/// Orders and gross sales (order totals, tax and shipping included) of one
+/// place, taken from the shipping address, or the billing address when an
+/// order has none. `region` is the province or state as the platform gives it:
+/// a code on WooCommerce, a name elsewhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationSales {
+    pub country: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    pub orders: u64,
+    pub total_sales: Decimal,
+}
+
+/// Per-place sales for a range, counting the same orders as the platform's
+/// `SalesReport`. Rows are sorted by gross sales, largest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationReport {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    pub currency: Option<String>,
+    pub rows: Vec<LocationSales>,
+}
+
+/// Country used for orders without any address.
+pub const UNKNOWN_COUNTRY: &str = "unknown";
+
+/// Sums orders into per-(country, region) rows while a connector pages them.
+#[derive(Debug, Default)]
+pub struct LocationTally {
+    rows: std::collections::BTreeMap<(String, Option<String>), (u64, Decimal)>,
+    currencies: std::collections::BTreeSet<String>,
+}
+
+impl LocationTally {
+    pub fn add(
+        &mut self,
+        country: Option<&str>,
+        region: Option<&str>,
+        total: Decimal,
+        currency: Option<&str>,
+    ) {
+        let clean = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let country = clean(country).unwrap_or_else(|| UNKNOWN_COUNTRY.to_string());
+        let row = self.rows.entry((country, clean(region))).or_default();
+        row.0 += 1;
+        row.1 += total;
+        if let Some(c) = clean(currency) {
+            self.currencies.insert(c);
+        }
+    }
+
+    pub fn orders(&self) -> u64 {
+        self.rows.values().map(|(n, _)| n).sum()
+    }
+
+    pub fn finish(self, range: &DateRange) -> LocationReport {
+        let currency = (self.currencies.len() == 1)
+            .then(|| self.currencies.into_iter().next())
+            .flatten();
+        let mut rows: Vec<_> = self
+            .rows
+            .into_iter()
+            .map(|((country, region), (orders, total_sales))| LocationSales {
+                country,
+                region,
+                orders,
+                total_sales,
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.total_sales));
+        LocationReport {
+            from: range.from,
+            to: range.to,
+            currency,
+            rows,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CustomerPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]

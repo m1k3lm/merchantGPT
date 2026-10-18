@@ -311,6 +311,46 @@ impl PrestaShop {
         self.send(Method::Get, path, &params, None).await
     }
 
+    /// Pages the range's valid orders with the given `display`, refusing
+    /// ranges over `MAX_REPORT_ORDERS`.
+    async fn report_orders(
+        &self,
+        range: &DateRange,
+        display: &str,
+        mut each: impl FnMut(&Value) -> Result<(), ConnectorError> + Send,
+    ) -> Result<(), ConnectorError> {
+        if range.to < range.from {
+            return Err(bad_request("`to` is before `from`"));
+        }
+        let mut offset = 0u64;
+        loop {
+            let params = vec![
+                ("display".into(), display.into()),
+                (
+                    "filter[date_add]".into(),
+                    date_range(Some(range.from), Some(range.to)),
+                ),
+                ("date".into(), "1".into()),
+                ("filter[valid]".into(), "[1]".into()),
+                ("sort".into(), "[id_ASC]".into()),
+                ("limit".into(), format!("{offset},{REPORT_PAGE}")),
+            ];
+            let orders = list(&self.get("orders", params).await?, "orders");
+            for o in &orders {
+                each(o)?;
+            }
+            if offset + orders.len() as u64 > MAX_REPORT_ORDERS {
+                return Err(bad_request(format!(
+                    "more than {MAX_REPORT_ORDERS} orders in this range; ask for a shorter range"
+                )));
+            }
+            if orders.len() < REPORT_PAGE as usize {
+                return Ok(());
+            }
+            offset += u64::from(REPORT_PAGE);
+        }
+    }
+
     async fn meta(&self) -> Result<Arc<Meta>, ConnectorError> {
         let mut cached = self.meta.lock().await;
         if let Some(m) = cached.as_ref() {
@@ -780,9 +820,6 @@ impl ShopConnector for PrestaShop {
     /// Sums the range's valid orders (statuses PrestaShop counts as sales).
     /// Net sales are products after discounts, excluding tax and shipping.
     async fn sales_report(&self, range: &DateRange) -> Result<SalesReport, ConnectorError> {
-        if range.to < range.from {
-            return Err(bad_request("`to` is before `from`"));
-        }
         let meta = self.meta().await?;
         let mut report = SalesReport {
             from: range.from,
@@ -794,50 +831,32 @@ impl ShopConnector for PrestaShop {
             currency: None,
         };
         let mut currencies = BTreeSet::new();
-        let mut offset = 0u64;
-        loop {
-            let params = vec![
-                ("display".into(), "full".into()),
-                (
-                    "filter[date_add]".into(),
-                    date_range(Some(range.from), Some(range.to)),
-                ),
-                ("date".into(), "1".into()),
-                ("filter[valid]".into(), "[1]".into()),
-                ("sort".into(), "[id_ASC]".into()),
-                ("limit".into(), format!("{offset},{REPORT_PAGE}")),
-            ];
-            let orders = list(&self.get("orders", params).await?, "orders");
-            for o in &orders {
-                let money = |k: &str| types::decimal(&o[k]).map(Option::unwrap_or_default);
-                report.total_sales += money("total_paid_tax_incl")?;
-                report.net_sales += money("total_products")? - money("total_discounts_tax_excl")?;
-                report.items += o["associations"]["order_rows"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|r| types::int(&r["product_quantity"]))
-                    .sum::<i64>()
-                    .max(0) as u64;
-                report.orders += 1;
-                if let Some(c) = types::string(&o["id_currency"]) {
-                    currencies.insert(meta.currencies.get(&c).cloned().unwrap_or(c));
-                }
+        self.report_orders(range, "full", |o| {
+            let money = |k: &str| types::decimal(&o[k]).map(Option::unwrap_or_default);
+            report.total_sales += money("total_paid_tax_incl")?;
+            report.net_sales += money("total_products")? - money("total_discounts_tax_excl")?;
+            report.items += o["associations"]["order_rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| types::int(&r["product_quantity"]))
+                .sum::<i64>()
+                .max(0) as u64;
+            report.orders += 1;
+            if let Some(c) = types::string(&o["id_currency"]) {
+                currencies.insert(meta.currencies.get(&c).cloned().unwrap_or(c));
             }
-            if report.orders > MAX_REPORT_ORDERS {
-                return Err(bad_request(format!(
-                    "more than {MAX_REPORT_ORDERS} orders in this range; ask for a shorter range"
-                )));
-            }
-            if orders.len() < REPORT_PAGE as usize {
-                break;
-            }
-            offset += u64::from(REPORT_PAGE);
-        }
+            Ok(())
+        })
+        .await?;
         if currencies.len() == 1 {
             report.currency = currencies.into_iter().next();
         }
         Ok(report)
+    }
+
+    async fn sales_by_location(&self, range: &DateRange) -> Result<LocationReport, ConnectorError> {
+        self.location_report(range).await
     }
 
     fn api_hint(&self) -> &'static str {
@@ -1310,6 +1329,82 @@ mod tests {
             .body
             .unwrap()
             .contains("<order_history><id_order>2</id_order><id_order_state>6</id_order_state></order_history>"));
+    }
+
+    #[tokio::test]
+    async fn sales_by_location_resolves_delivery_addresses_to_countries_and_states() {
+        let t = Arc::new(FakeTransport::new());
+        states(&t);
+        let order = |address: u64, total: &str| json!({"id": address, "id_currency": 1, "total_paid_tax_incl": total, "id_address_delivery": address});
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/orders",
+            json!({"orders": [order(7, "100.00"), order(8, "20.50"), order(7, "10.00"), order(99, "3.00")]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/addresses",
+            json!({"addresses": [
+                {"id": 7, "id_country": 6, "id_state": 330},
+                {"id": 8, "id_country": 15, "id_state": 0}
+            ]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/countries",
+            json!({"countries": [{"id": 6, "iso_code": "ES"}, {"id": 15, "iso_code": "PT"}]}),
+        );
+        ok(
+            &t,
+            Method::Get,
+            "/es/api/states",
+            json!({"states": [{"id": 330, "name": "Madrid"}]}),
+        );
+        let r = shop(&t)
+            .sales_by_location(&DateRange {
+                from: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                to: NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+            })
+            .await
+            .unwrap();
+        let rows: Vec<_> = r
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.country.as_str(),
+                    r.region.as_deref(),
+                    r.orders,
+                    r.total_sales,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ES", Some("Madrid"), 2, dec("110")),
+                ("PT", None, 1, dec("20.5")),
+                ("unknown", None, 1, dec("3")),
+            ]
+        );
+        assert_eq!(r.currency.as_deref(), Some("EUR"));
+        let reqs = t.requests();
+        let find = |path: &str| reqs.iter().find(|r| r.path() == path).unwrap();
+        assert_eq!(
+            query(find("/es/api/addresses"), "filter[id]").as_deref(),
+            Some("[7|8|99]")
+        );
+        assert_eq!(
+            query(find("/es/api/states"), "display").as_deref(),
+            Some("[id,name]")
+        );
+        assert_eq!(
+            query(find("/es/api/orders"), "filter[valid]").as_deref(),
+            Some("[1]")
+        );
     }
 
     #[tokio::test]

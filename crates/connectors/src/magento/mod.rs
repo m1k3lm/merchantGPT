@@ -584,6 +584,81 @@ impl ShopConnector for Magento {
     /// Magento's REST API has no sales report, so this sums the range's
     /// non-cancelled orders. Dates are compared with Magento's UTC timestamps.
     async fn sales_report(&self, range: &DateRange) -> Result<SalesReport, ConnectorError> {
+        let mut report = SalesReport {
+            from: range.from,
+            to: range.to,
+            total_sales: Decimal::ZERO,
+            net_sales: Decimal::ZERO,
+            orders: 0,
+            items: 0,
+            currency: None,
+        };
+        let mut currencies = std::collections::BTreeSet::new();
+        self.report_orders(
+            range,
+            "grand_total,subtotal,discount_amount,subtotal_refunded,total_qty_ordered,order_currency_code",
+            |o| {
+                let money = |k: &str| types::decimal(&o[k]).map(Option::unwrap_or_default);
+                report.total_sales += money("grand_total")?;
+                report.net_sales +=
+                    money("subtotal")? + money("discount_amount")? - money("subtotal_refunded")?;
+                report.items += money("total_qty_ordered")?
+                    .round()
+                    .to_string()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                report.orders += 1;
+                if let Some(c) = o["order_currency_code"].as_str() {
+                    currencies.insert(c.to_string());
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        if currencies.len() == 1 {
+            report.currency = currencies.into_iter().next();
+        }
+        Ok(report)
+    }
+
+    /// The shipping address sits in the order's shipping assignments; virtual
+    /// orders have only a billing address.
+    async fn sales_by_location(&self, range: &DateRange) -> Result<LocationReport, ConnectorError> {
+        let mut tally = LocationTally::default();
+        self.report_orders(
+            range,
+            "grand_total,order_currency_code,billing_address[country_id,region],extension_attributes[shipping_assignments[shipping[address[country_id,region]]]]",
+            |o| {
+                let shipping = o["extension_attributes"]["shipping_assignments"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|a| &a["shipping"]["address"])
+                    .find(|a| a["country_id"].is_string());
+                let address = shipping.unwrap_or(&o["billing_address"]);
+                tally.add(
+                    address["country_id"].as_str(),
+                    address["region"].as_str(),
+                    types::decimal(&o["grand_total"])?.unwrap_or_default(),
+                    o["order_currency_code"].as_str(),
+                );
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(tally.finish(range))
+    }
+}
+
+impl Magento {
+    /// Pages the range's non-cancelled orders, asking only for `fields` of
+    /// each, and refuses ranges over `MAX_REPORT_ORDERS`.
+    async fn report_orders(
+        &self,
+        range: &DateRange,
+        fields: &str,
+        mut each: impl FnMut(&Value) -> Result<(), ConnectorError> + Send,
+    ) -> Result<(), ConnectorError> {
         if range.to < range.from {
             return Err(ConnectorError::Api {
                 status: 400,
@@ -597,16 +672,6 @@ impl ShopConnector for Magento {
                 status: 400,
                 message: "date out of range".into(),
             })?;
-        let mut report = SalesReport {
-            from: range.from,
-            to: range.to,
-            total_sales: Decimal::ZERO,
-            net_sales: Decimal::ZERO,
-            orders: 0,
-            items: 0,
-            currency: None,
-        };
-        let mut currencies = std::collections::BTreeSet::new();
         let mut page = 1;
         loop {
             let c = Criteria::page(page, MAX_PER_PAGE)
@@ -622,10 +687,7 @@ impl ShopConnector for Magento {
                 )])
                 .and(vec![Filter::cond("status", "nin", "canceled")]);
             let mut params = c.params();
-            params.push((
-                "fields".into(),
-                "items[grand_total,subtotal,discount_amount,subtotal_refunded,total_qty_ordered,order_currency_code],total_count".into(),
-            ));
+            params.push(("fields".into(), format!("items[{fields}],total_count")));
             let v = self.get("/orders", &params).await?;
             let total = v["total_count"].as_u64().unwrap_or(0);
             if total > MAX_REPORT_ORDERS {
@@ -638,29 +700,13 @@ impl ShopConnector for Magento {
             }
             let items = v["items"].as_array().cloned().unwrap_or_default();
             for o in &items {
-                let money = |k: &str| types::decimal(&o[k]).map(Option::unwrap_or_default);
-                report.total_sales += money("grand_total")?;
-                report.net_sales +=
-                    money("subtotal")? + money("discount_amount")? - money("subtotal_refunded")?;
-                report.items += money("total_qty_ordered")?
-                    .round()
-                    .to_string()
-                    .parse::<u64>()
-                    .unwrap_or(0);
-                report.orders += 1;
-                if let Some(c) = o["order_currency_code"].as_str() {
-                    currencies.insert(c.to_string());
-                }
+                each(o)?;
             }
             if items.is_empty() || u64::from(page) * u64::from(MAX_PER_PAGE) >= total {
-                break;
+                return Ok(());
             }
             page += 1;
         }
-        if currencies.len() == 1 {
-            report.currency = currencies.into_iter().next();
-        }
-        Ok(report)
     }
 }
 
@@ -967,6 +1013,67 @@ mod tests {
         assert!(query(&t.requests()[0], "fields")
             .unwrap()
             .contains("grand_total"));
+    }
+
+    #[tokio::test]
+    async fn sales_by_location_prefers_the_shipping_address() {
+        let t = Arc::new(FakeTransport::new());
+        let ship = |country: &str, region: &str| json!({"shipping_assignments": [{"shipping": {"address": {"country_id": country, "region": region}}}]});
+        let body = json!({"total_count": 4, "items": [
+            {"grand_total": 100, "order_currency_code": "EUR",
+             "billing_address": {"country_id": "ES", "region": "Madrid"},
+             "extension_attributes": ship("ES", "Barcelona")},
+            {"grand_total": "50.5", "order_currency_code": "EUR",
+             "billing_address": {"country_id": "ES", "region": "Barcelona"},
+             "extension_attributes": ship("ES", "Barcelona")},
+            {"grand_total": 20, "order_currency_code": "EUR",
+             "billing_address": {"country_id": "PT", "region": "Lisboa"}},
+            {"grand_total": 5, "order_currency_code": "EUR"}
+        ]});
+        t.on(
+            Method::Get,
+            "/rest/V1/orders",
+            HttpResponse::new(200, body.to_string()),
+        );
+        let r = magento(&t)
+            .sales_by_location(&DateRange {
+                from: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                to: NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.currency.as_deref(), Some("EUR"));
+        let rows: Vec<_> = r
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.country.as_str(),
+                    r.region.as_deref(),
+                    r.orders,
+                    r.total_sales,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ES", Some("Barcelona"), 2, dec("150.5")),
+                ("PT", Some("Lisboa"), 1, dec("20")),
+                ("unknown", None, 1, dec("5")),
+            ]
+        );
+        let fields = query(&t.requests()[0], "fields").unwrap();
+        assert!(fields.contains("shipping_assignments[shipping[address[country_id,region]]]"));
+        assert!(!fields.contains("subtotal"), "{fields}");
+        assert_eq!(
+            query(
+                &t.requests()[0],
+                "searchCriteria[filter_groups][2][filters][0][value]"
+            )
+            .as_deref(),
+            Some("canceled")
+        );
     }
 
     #[tokio::test]
