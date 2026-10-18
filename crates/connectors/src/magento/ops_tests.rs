@@ -882,3 +882,29 @@ async fn raw_requests_go_under_rest_with_bearer_auth() {
     assert_eq!(req.header_value("authorization"), Some("Bearer tok123"));
     assert_eq!(query(req, "searchCriteria[pageSize]").as_deref(), Some("5"));
 }
+
+#[tokio::test]
+async fn raw_errors_come_back_with_their_status_and_message() {
+    let t = Arc::new(FakeTransport::new());
+    t.on(
+        Method::Delete,
+        "/rest/V1/products/X",
+        HttpResponse::new(
+            404,
+            r#"{"message":"The product that was requested doesn't exist."}"#,
+        ),
+    );
+    let resp = magento(&t)
+        .raw(&RawRequest {
+            method: "DELETE".into(),
+            path: "/V1/products/X".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, 404);
+    assert_eq!(
+        resp.body["message"],
+        "The product that was requested doesn't exist."
+    );
+}

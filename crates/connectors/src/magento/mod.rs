@@ -441,8 +441,20 @@ impl ShopConnector for Magento {
         if !req.query.is_empty() {
             url.query_pairs_mut().extend_pairs(&req.query);
         }
-        let body = self.send(method, url.to_string(), req.body.clone()).await?;
-        Ok(RawResponse { status: 200, body })
+        // The response is returned whatever its status, so the model sees
+        // Magento's own error message instead of a summary.
+        let mut http = HttpRequest::new(method, url.to_string())
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/json");
+        if let Some(b) = &req.body {
+            http = http.json(b);
+        }
+        let resp = self.transport.send(http).await?;
+        let body = serde_json::from_str(&resp.body).unwrap_or(Value::String(resp.body));
+        Ok(RawResponse {
+            status: resp.status,
+            body,
+        })
     }
 
     async fn verify(&self) -> Result<(), ConnectorError> {
