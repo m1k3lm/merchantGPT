@@ -124,6 +124,9 @@ pub enum ConnectorError {
     InvalidResponse(String),
     #[error("could not reach the shop: {0}")]
     Transport(String),
+    /// A service other than the shop could not be reached; the message names it.
+    #[error("{0}")]
+    Unreachable(String),
 }
 
 impl From<ConnectorError> for tools::ToolError {

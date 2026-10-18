@@ -136,10 +136,9 @@ pub async fn call(
         Ok(r) => r,
         // The shared transport error says "the shop"; this is another service.
         Err(ConnectorError::Transport(e)) => {
-            return Err(ConnectorError::Api {
-                status: 0,
-                message: format!("could not reach {service}: {e}"),
-            })
+            return Err(ConnectorError::Unreachable(format!(
+                "could not reach {service}: {e}"
+            )))
         }
         Err(e) => return Err(e),
     };
