@@ -7,7 +7,9 @@ It is a native Rust application for macOS, Linux and Windows. There is no accoun
 ## What it can do
 
 - **Chat with your shop.** List and search products, orders and customers, read single orders with their line items, and get sales reports for any date range.
-- **Change the shop, with your approval.** Update product name, price, sale price, stock and status, or change an order's status. Every change appears as a confirmation card showing the exact values; nothing is written until you click Approve.
+- **Run the shop, with your approval.** Create, change and delete products (prices, sales, stock, descriptions, categories), categories, customers and their addresses, discount coupons and orders (create, change status, add a note, delete). Every change appears as a confirmation card showing the exact values; nothing is written until you click Approve, and deletes are marked as permanent.
+- **Anything else the shop's API offers.** When no dedicated action covers something, the assistant can read and write through the platform's own API (WooCommerce REST, Magento REST, Shopify GraphQL, PrestaShop webservice), with the same approval for every write.
+- **Retargeting.** List abandoned carts (Magento, Shopify with a recovery link, PrestaShop), add a note to an order that the platform emails to the customer (WooCommerce, Magento), and link email and marketing services to a shop with **+**: your own mailbox over SMTP, Brevo, Mailchimp or Klaviyo, to send reminders, sync customers to lists and create or send campaigns. Marketing goes only to customers who opted in: the send and list tools require you to confirm consent.
 - **Activity log.** Every change the assistant made or tried to make, approved or denied, is kept per shop under **Activity**.
 - **Several shops.** Switch between shops in the side panel; each shop has its own chats, notes and tasks.
 - **Saved chats.** Conversations are kept and can be reopened, renamed or deleted.
@@ -90,6 +92,7 @@ Anything compiled into a desktop app can be extracted from the binary. The devel
 
 - **WooCommerce:** in the WordPress admin go to WooCommerce > Settings > Advanced > REST API, add a key with Read/Write permission, and copy the consumer key and secret. HTTPS stores use Basic auth; plain-HTTP stores are signed with OAuth 1.0a automatically.
 - **Magento 2:** go to System > Integrations, add an integration with API access to Catalog, Sales and Customers, activate it and copy the **Access Token** (the other three values are not used). On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" to Yes. Integration tokens do not expire; rotate one with **Reauthorize**.
+- **Addresses in Spain** and other countries that ask for one need an ID number (DNI/NIE/NIF): PrestaShop requires it, Magento stores it as the VAT id, WooCommerce and Shopify have no field for it.
 - **Shopify:** either paste the **Admin API access token** of a custom app made in the Shopify admin (Settings > Apps and sales channels > Develop apps; Shopify no longer lets you create new ones there since January 2026), or create an app in the Shopify **Dev Dashboard** under the organization that owns the store, give it the scopes `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_locations`, `read_orders`, `write_orders`, `read_customers`, `write_customers`, `read_discounts` and `write_discounts` (plus `read_all_orders` for orders older than 60 days; listing abandoned checkouts also needs the staff permission to manage them), install it on the store and enter its **client ID and secret**. The app then fetches 24-hour tokens itself. If your shop URL is a custom domain, also enter the store's `myshopify.com` domain.
 - **PrestaShop 8 or 9:** in the back office go to Advanced Parameters > Webservice, enable the webservice, add a key and give it `products`, `stock_availables` and `specific_prices` (all methods), `orders`, `order_states`, `customers` and `currencies` (GET), and `order_histories` (GET and POST). If the shop is in a subfolder, include it in the shop URL. Status changes accept the shop's own status names (for example "Payment accepted") or common words such as "cancelled" and "shipped"; they do not email the customer.
 
@@ -100,6 +103,17 @@ Click **+**, then **Google Ads** (a shop must be selected; the ads account is li
 Merchants never enter Google credentials other than their own sign-in: the app's credentials ship inside the release build (see [Release builds with Google Ads credentials](#release-builds-with-google-ads-credentials)). A build made without them asks for the missing ones once and stores them encrypted.
 
 To unlink, right-click the shop and choose **Unlink Google Ads**.
+
+### Email and marketing services
+
+Click **+** and pick **Email (SMTP)**, **Brevo**, **Mailchimp** or **Klaviyo** under "Email and marketing" (a shop must be selected; the service is linked to it). Each form explains where to get the key:
+
+- **Email (SMTP):** your mailbox's server, user and password (with Gmail or Microsoft 365, an app password). Port 587 uses STARTTLS, 465 TLS.
+- **Brevo:** an API key and a sender address verified in Brevo.
+- **Mailchimp:** an API key (it ends in your data center, e.g. `-us21`), plus the from name and reply-to address for campaigns.
+- **Klaviyo:** a private API key with access to lists, profiles, campaigns, templates and subscriptions.
+
+The shop list shows a badge per linked service; right-click the shop to unlink one.
 
 ### Where things are stored
 
@@ -182,7 +196,19 @@ docker compose --profile presta exec presta bash /scripts/presta-setup.sh   # en
 PRESTA_URL=http://localhost:8081 PRESTA_KEY=... cargo test -p connectors --test prestashop_live -- --ignored
 ```
 
-The test changes one product and one order and puts them back. `PRESTA_IMAGE` can point the service at an already-pulled image built on the official one.
+The tests create, change and delete one of each kind of record and put back what they change. `PRESTA_IMAGE` can point the service at an already-pulled image built on the official one.
+
+### Live test against a local mail catcher
+
+The `mail` profile runs mailpit, which accepts any SMTP login and shows what was sent at `http://localhost:8025`.
+
+```bash
+docker compose --profile mail up -d mailpit
+cargo test -p connectors --test mail_smtp_live -- --ignored
+docker compose --profile mail stop mailpit
+```
+
+Brevo, Mailchimp and Klaviyo are tested against simulated responses only.
 
 To reset a store, remove only its containers and volumes. Do not use `docker compose down -v`, which also deletes the build cache volumes:
 
@@ -198,7 +224,7 @@ docker volume rm merchantgpt_presta-db merchantgpt_presta-html
 | Path | Purpose |
 |---|---|
 | `crates/tools` | Tool definitions shared by connectors and the AI layer |
-| `crates/connectors` | Shop connectors (WooCommerce, Magento, Shopify, PrestaShop), Google Ads and HTTP transport |
+| `crates/connectors` | Shop connectors (WooCommerce, Magento, Shopify, PrestaShop), Google Ads, email and marketing services, and HTTP transport |
 | `crates/llm` | AI provider clients with streaming and tool calling |
 | `crates/skills` | Skill loading, slash commands and script running |
 | `crates/store` | Encrypted SQLite database and keychain access |
@@ -209,8 +235,10 @@ docker volume rm merchantgpt_presta-db merchantgpt_presta-html
 
 ## Known limitations
 
-- The Magento, Shopify and Google Ads connectors have not yet been verified against a live store or account.
-- PrestaShop stock can only be set for products without combinations, and product updates need PrestaShop 8 or later (1.7 has no PATCH). Prices are the shop's base prices excluding tax.
-- Shopify orders cannot be fulfilled from the assistant, and cancelling one does not refund it; do both in the Shopify admin.
+- The Magento, Shopify, Google Ads, Brevo, Mailchimp and Klaviyo connectors have not yet been verified against a live store or account.
+- WooCommerce core keeps no abandoned carts, so they are not available there.
+- PrestaShop stock can only be set for products without combinations, and product updates need PrestaShop 8 or later (1.7 has no PATCH). Prices are the shop's base prices excluding tax. New orders need an active free carrier and use catalog prices; order notes are private (PrestaShop cannot email them).
+- Magento and Shopify orders are cancelled, not deleted. New Magento orders use an offline payment method and catalog prices.
+- Shopify orders cannot be fulfilled from the assistant, cancelling one does not refund it, and order notes cannot be emailed to the customer; do those in the Shopify admin.
 - Windows binaries are not produced yet; build on Windows directly or add a CI runner.
 - Shared or published builds must be hosted on seQura's `tech-ai-tools` S3 bucket (request access in Slack #ai-tools).
