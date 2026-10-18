@@ -4,6 +4,7 @@
 pub mod domain;
 pub mod google_ads;
 pub mod magento;
+pub mod mail;
 pub mod platform;
 pub mod prestashop;
 pub mod registry;

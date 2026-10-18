@@ -2351,9 +2351,17 @@ mod tests {
         assert!(
             matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not connected this way"))
         );
+        f.transport.on(
+            connectors::transport::Method::Get,
+            "/v3/account",
+            connectors::transport::HttpResponse::new(
+                401,
+                r#"{"code":"unauthorized","message":"Key not found"}"#,
+            ),
+        );
         f.backend.handle(connect(ConnectorKind::Brevo)).await;
         assert!(
-            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not implemented")),
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("Could not connect Brevo") && e.contains("Key not found")),
             "{:?}",
             f.events().last()
         );
@@ -2373,6 +2381,59 @@ mod tests {
         assert!(
             matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not added as one"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_verified_service_is_saved_and_adds_its_tools() {
+        let mut f = fixture();
+        f.connect("a.test", Platform::Shopify).await;
+        let shop = f.backend.active_shop_id().unwrap();
+        f.transport.on(
+            connectors::transport::Method::Get,
+            "/v3/account",
+            connectors::transport::HttpResponse::new(200, r#"{"email":"shop@example.com"}"#),
+        );
+        f.backend
+            .handle(Command::ConnectService {
+                kind: ConnectorKind::Brevo,
+                credentials: Credentials::from([
+                    ("api_key".into(), "xkeysib-secret".into()),
+                    ("sender_email".into(), "shop@example.com".into()),
+                ]),
+            })
+            .await;
+        let events = f.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BackendEvent::Notice(n) if n == "Brevo linked to this shop.")),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e,
+            BackendEvent::Shops { shops, .. } if shops[0].connectors.contains(&ConnectorKind::Brevo))));
+        let request = f.transport.requests().last().cloned().unwrap();
+        assert_eq!(request.url, "https://api.brevo.com/v3/account");
+        assert_eq!(request.header_value("api-key"), Some("xkeysib-secret"));
+        assert!(f
+            .store
+            .credentials(shop)
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == ConnectorKind::Brevo.id()));
+        let names: Vec<String> = f
+            .backend
+            .tools()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for tool in [
+            "brevo_send_email",
+            "brevo_create_campaign",
+            "shop_list_orders",
+        ] {
+            assert!(names.iter().any(|n| n == tool), "{tool} in {names:?}");
+        }
     }
 
     #[tokio::test]

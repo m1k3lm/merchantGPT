@@ -121,10 +121,7 @@ impl ConnectorRegistry {
             )));
         }
         if ConnectorKind::MAIL.contains(&kind) {
-            return Err(ConnectorError::NotImplemented(format!(
-                "the {} connector",
-                kind.display_name()
-            )));
+            return crate::mail::build(kind, credentials, transport);
         }
         if kind == ConnectorKind::GoogleAds {
             return Ok(Arc::new(crate::google_ads::GoogleAds::from_credentials(
