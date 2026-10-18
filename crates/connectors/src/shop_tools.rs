@@ -164,7 +164,8 @@ fn address_props() -> Value {
         "address1": {"type": "string"}, "address2": {"type": "string"}, "city": {"type": "string"},
         "postcode": {"type": "string"}, "state": {"type": "string"},
         "country": {"type": "string", "description": "ISO 3166-1 alpha-2, e.g. ES"},
-        "phone": {"type": "string"}
+        "phone": {"type": "string"},
+        "id_number": {"type": "string", "description": "Tax or national id (DNI/NIE/NIF) where the country requires one"}
     })
 }
 

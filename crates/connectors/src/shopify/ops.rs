@@ -11,7 +11,8 @@ use super::{
     bad_request, check_user_errors, filter, is_mutation, per_page, queries, Shopify, MAX_PER_PAGE,
 };
 use crate::domain::*;
-use crate::{ConnectorError, ShopConnector};
+use crate::shop::refuse_id_number;
+use crate::{ConnectorError, Platform, ShopConnector};
 
 /// Discounts and abandoned checkouts nest connections, which multiply the cost.
 const MAX_NESTED_PER_PAGE: u32 = 50;
@@ -351,6 +352,7 @@ impl Shopify {
         id: Option<&str>,
         a: &AddressPatch,
     ) -> Result<Address, ConnectorError> {
+        refuse_id_number(Platform::Shopify, Some(a))?;
         let set_default = types::wants_default(a);
         if set_default == Some(false) {
             return Err(bad_request(
@@ -404,6 +406,8 @@ impl Shopify {
     /// Creates the order without emailing the customer; stock is claimed as
     /// the products' inventory policy allows. `status` is the payment status.
     pub(super) async fn create_order_op(&self, o: &NewOrder) -> Result<Order, ConnectorError> {
+        refuse_id_number(Platform::Shopify, o.billing.as_ref())?;
+        refuse_id_number(Platform::Shopify, o.shipping.as_ref())?;
         if o.line_items.is_empty() {
             return Err(bad_request("an order needs line items"));
         }

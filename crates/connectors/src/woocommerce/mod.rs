@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
 use crate::domain::*;
-use crate::shop::unsupported;
+use crate::shop::{refuse_id_number, unsupported};
 use crate::transport::{HttpResponse, HttpTransport, Method};
 use crate::{ConnectorError, Credentials, Platform, ShopConnector};
 pub use auth::WooAuth;
@@ -580,6 +580,7 @@ impl ShopConnector for WooCommerce {
         customer_id: &str,
         a: &AddressPatch,
     ) -> Result<Address, ConnectorError> {
+        refuse_id_number(Platform::WooCommerce, Some(a))?;
         let slot = slot(a.kind.as_deref().unwrap_or_default())?;
         self.put_slot(customer_id, slot, address_fields(a, true))
             .await?
@@ -592,6 +593,7 @@ impl ShopConnector for WooCommerce {
         id: &str,
         a: &AddressPatch,
     ) -> Result<Address, ConnectorError> {
+        refuse_id_number(Platform::WooCommerce, Some(a))?;
         let slot = slot(id)?;
         if a.kind
             .as_deref()
@@ -621,6 +623,8 @@ impl ShopConnector for WooCommerce {
     /// Without addresses, an order for a registered customer gets the
     /// customer's saved ones. `note` becomes a private order note.
     async fn create_order(&self, o: &NewOrder) -> Result<Order, ConnectorError> {
+        refuse_id_number(Platform::WooCommerce, o.billing.as_ref())?;
+        refuse_id_number(Platform::WooCommerce, o.shipping.as_ref())?;
         let mut body = Map::new();
         let mut saved = None;
         if let Some(id) = &o.customer_id {
@@ -778,6 +782,34 @@ mod tests {
 
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn id_numbers_are_refused_before_any_request() {
+        let t = Arc::new(FakeTransport::new());
+        let address = AddressPatch {
+            kind: Some("billing".into()),
+            city: Some("Madrid".into()),
+            id_number: Some("12345678Z".into()),
+            ..Default::default()
+        };
+        let err = woo(&t).create_address("5", &address).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectorError::Unsupported(ref m) if m.contains("DNI")),
+            "{err}"
+        );
+        let order = NewOrder {
+            email: Some("a@b.c".into()),
+            billing: Some(address),
+            line_items: vec![NewLineItem {
+                product_id: "1".into(),
+                quantity: 1,
+                price: None,
+            }],
+            ..Default::default()
+        };
+        assert!(woo(&t).create_order(&order).await.is_err());
+        assert!(t.requests().is_empty());
     }
 
     #[tokio::test]

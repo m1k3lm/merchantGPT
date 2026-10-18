@@ -324,9 +324,26 @@ async fn creates_changes_and_deletes_records_on_a_live_store() {
         )
         .await;
     assert!(
-        matches!(spain, Err(ConnectorError::Unsupported(ref m)) if m.contains("DNI")),
+        matches!(spain, Err(ConnectorError::Api { status: 400, ref message }) if message.contains("DNI")),
         "{spain:?}"
     );
+    let spain = shop
+        .create_address(
+            &customer.id,
+            &AddressPatch {
+                country: Some("ES".into()),
+                state: Some("M".into()),
+                id_number: Some("12345678Z".into()),
+                ..paris.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (spain.country.as_deref(), spain.id_number.as_deref()),
+        (Some("ES"), Some("12345678Z"))
+    );
+    shop.delete_address(&customer.id, &spain.id).await.unwrap();
 
     let coupon = shop
         .create_coupon(&CouponPatch {

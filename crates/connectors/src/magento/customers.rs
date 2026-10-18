@@ -201,6 +201,7 @@ impl Magento {
             ("city", &a.city),
             ("postcode", &a.postcode),
             ("telephone", &a.phone),
+            ("vat_id", &a.id_number),
         ] {
             if let Some(v) = value {
                 target.insert(key.into(), json!(v.trim()));

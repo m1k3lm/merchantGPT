@@ -211,6 +211,7 @@ impl WooAddress {
             state: f(&self.state),
             country: f(&self.country),
             phone: f(&self.phone),
+            id_number: None,
         }
     }
 
@@ -229,6 +230,7 @@ impl WooAddress {
             state: non_empty(self.state),
             country: non_empty(self.country),
             phone: non_empty(self.phone),
+            id_number: None,
         };
         let blank = Address {
             id: a.id.clone(),

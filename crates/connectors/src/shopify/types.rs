@@ -199,6 +199,7 @@ pub(crate) fn address(a: &Value, default_id: Option<&str>) -> Result<Address, Co
         country: string(&a["countryCodeV2"]),
         phone: string(&a["phone"]),
         id,
+        id_number: None,
     })
 }
 

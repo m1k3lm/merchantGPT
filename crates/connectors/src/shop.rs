@@ -135,6 +135,20 @@ pub trait ShopConnector: Send + Sync {
     }
 }
 
+/// For platforms whose addresses have no field for a tax or national id.
+pub fn refuse_id_number(
+    platform: Platform,
+    a: Option<&AddressPatch>,
+) -> Result<(), ConnectorError> {
+    if a.is_some_and(|a| a.id_number.is_some()) {
+        return Err(unsupported(
+            platform,
+            "an id number (DNI/NIF) on addresses; put it in the company or address2 field if the merchant wants it on the address",
+        ));
+    }
+    Ok(())
+}
+
 pub fn unsupported(platform: Platform, what: &str) -> ConnectorError {
     ConnectorError::Unsupported(format!(
         "{} does not support {what} through its API",

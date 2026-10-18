@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::xml::{self, Field};
 use super::{bad_request, list, literal, numeric_id, one_of, types, PrestaShop};
 use crate::domain::*;
-use crate::{shop::unsupported, ConnectorError, Platform};
+use crate::ConnectorError;
 
 pub(super) const CUSTOMER_FIELDS: &str = "[id,email,firstname,lastname,newsletter]";
 /// PrestaShop's standard "Customer" group, created at install.
@@ -300,16 +300,14 @@ impl PrestaShop {
         &self,
         country: &str,
         state: Option<&str>,
+        id_number: Option<&str>,
     ) -> Result<Vec<(&'static str, Field)>, ConnectorError> {
         let c = self.country(country).await?;
-        if c.needs_id_number {
-            return Err(unsupported(
-                Platform::PrestaShop,
-                &format!(
-                    "addresses in {} without an identification number (DNI), which this shop requires there; add it in the back office or with shop_api_write and a <dni> field",
-                    country.trim().to_uppercase()
-                ),
-            ));
+        if c.needs_id_number && id_number.is_none_or(|n| n.trim().is_empty()) {
+            return Err(bad_request(format!(
+                "addresses in {} need an id_number (DNI/NIE/NIF) in this shop",
+                country.trim().to_uppercase()
+            )));
         }
         let mut fields = vec![("id_country", Field::Text(c.id.clone()))];
         match (c.contains_states, state.filter(|s| !s.trim().is_empty())) {
@@ -336,6 +334,7 @@ impl PrestaShop {
             ("city", &a.city),
             ("postcode", &a.postcode),
             ("phone", &a.phone),
+            ("dni", &a.id_number),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.as_ref().map(|v| (k, Field::Text(v.trim().to_string()))))
@@ -364,7 +363,10 @@ impl PrestaShop {
         filled.kind.get_or_insert_with(|| "Address".into());
         let mut fields = vec![("id_customer", Field::Text(customer_id.into()))];
         fields.extend(Self::text_fields(&filled));
-        fields.extend(self.place_fields(country, a.state.as_deref()).await?);
+        fields.extend(
+            self.place_fields(country, a.state.as_deref(), a.id_number.as_deref())
+                .await?,
+        );
         let v = self
             .post("addresses", xml::document("address", &fields))
             .await?;
@@ -382,8 +384,13 @@ impl PrestaShop {
         let id = types::string(&row["id"]).unwrap_or_default();
         let mut fields = vec![("id", Field::Text(id.clone()))];
         fields.extend(Self::text_fields(a));
+        // The saved id number counts when only the country changes.
+        let id_number = a.id_number.clone().or_else(|| types::string(&row["dni"]));
         if let Some(country) = &a.country {
-            fields.extend(self.place_fields(country, a.state.as_deref()).await?);
+            fields.extend(
+                self.place_fields(country, a.state.as_deref(), id_number.as_deref())
+                    .await?,
+            );
         } else if let Some(state) = &a.state {
             let iso = self
                 .places(std::slice::from_ref(&row))
@@ -392,7 +399,10 @@ impl PrestaShop {
                 .get(&types::string(&row["id_country"]).unwrap_or_default())
                 .cloned()
                 .ok_or_else(|| bad_request("give the country together with the state"))?;
-            fields.extend(self.place_fields(&iso, Some(state)).await?);
+            fields.extend(
+                self.place_fields(&iso, Some(state), id_number.as_deref())
+                    .await?,
+            );
         }
         self.patch(
             &format!("addresses/{id}"),

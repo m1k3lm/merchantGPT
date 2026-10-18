@@ -212,6 +212,7 @@ impl Magento {
             ("city", &a.city),
             ("postcode", &a.postcode),
             ("telephone", &a.phone),
+            ("vat_id", &a.id_number),
         ] {
             if let Some(v) = value {
                 out.insert(key.into(), json!(v.trim()));
@@ -281,6 +282,7 @@ fn from_customer_address(a: &Value, email: Option<&str>) -> Value {
         "postcode": a["postcode"],
         "country_id": a["country_id"],
         "telephone": a["telephone"],
+        "vat_id": a["vat_id"],
         "region": region["region"],
         "region_id": region["region_id"],
         "region_code": region["region_code"],

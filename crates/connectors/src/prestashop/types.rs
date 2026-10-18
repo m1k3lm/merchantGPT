@@ -305,6 +305,7 @@ pub(crate) fn address(a: &Value, places: &Places) -> Result<Address, ConnectorEr
         state: lookup(&places.states, "id_state"),
         country: lookup(&places.countries, "id_country"),
         phone: string(&a["phone"]).or_else(|| string(&a["phone_mobile"])),
+        id_number: string(&a["dni"]),
     })
 }
 

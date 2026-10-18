@@ -285,6 +285,9 @@ pub struct Address {
     pub country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    /// Tax or national id (DNI, NIE, NIF, VAT) some countries require on addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -311,6 +314,9 @@ pub struct AddressPatch {
     pub country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    /// Tax or national id (DNI, NIE, NIF, VAT) some countries require on addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_number: Option<String>,
 }
 
 impl AddressPatch {

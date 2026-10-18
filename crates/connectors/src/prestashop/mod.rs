@@ -1654,7 +1654,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(address, Err(ConnectorError::Unsupported(ref m)) if m.contains("DNI")),
+            matches!(address, Err(ConnectorError::Api { status: 400, ref message }) if message.contains("id_number (DNI")),
             "{address:?}"
         );
         assert!(t.requests().iter().all(|r| r.method == Method::Get));

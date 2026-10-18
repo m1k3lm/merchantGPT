@@ -211,6 +211,7 @@ pub(crate) fn address(a: &Value) -> Result<Address, ConnectorError> {
         state: string(&region["region"]).or_else(|| string(&region["region_code"])),
         country: string(&a["country_id"]),
         phone: string(&a["telephone"]),
+        id_number: string(&a["vat_id"]),
     })
 }
 
