@@ -64,6 +64,8 @@ pub struct AppState {
     /// App credentials compiled into this build; the UI never asks for them.
     pub google_built_in: chat_core::GoogleBuiltIn,
     pub google_sign_in: GoogleSignInState,
+    /// What a new task of the active shop could be allowed to do unattended.
+    pub task_permissions: Vec<String>,
 }
 
 /// Calls that remove something for good, so the confirmation card can say so.
@@ -77,6 +79,23 @@ pub fn is_destructive(call: &ToolCall) -> bool {
     call.name.contains("delete")
         || arg("action").as_deref() == Some("delete")
         || (call.name.ends_with("_api_write") && arg("method").as_deref() == Some("delete"))
+}
+
+/// "order: add note" for `shop_manage_order:add_note`, "email send" for `email_send`.
+pub fn permission_label(key: &str) -> String {
+    let (tool, action) = match key.split_once(':') {
+        Some((t, a)) => (t, Some(a)),
+        None => (key, None),
+    };
+    let tool = tool
+        .strip_prefix("shop_manage_")
+        .or_else(|| tool.strip_prefix("shop_"))
+        .unwrap_or(tool)
+        .replace('_', " ");
+    match action {
+        Some(a) => format!("{tool}: {}", a.replace('_', " ")),
+        None => tool,
+    }
 }
 
 /// " · Ads · Brevo" for the services linked to a shop.
@@ -245,6 +264,7 @@ impl AppState {
             BackendEvent::LlmSettings(s) => self.llm_settings = s,
             BackendEvent::Skills(s) => self.skills = s,
             BackendEvent::Tasks(t) => self.tasks = t,
+            BackendEvent::TaskPermissions(p) => self.task_permissions = p,
             BackendEvent::Audit(rows) => self.audit = rows,
             BackendEvent::GoogleAdsApp {
                 configured,
@@ -360,6 +380,16 @@ mod tests {
             "shop_api_write",
             serde_json::json!({"method": "POST", "path": "/coupons"})
         )));
+    }
+
+    #[test]
+    fn permissions_read_as_plain_actions() {
+        assert_eq!(
+            permission_label("shop_manage_order:add_note"),
+            "order: add note"
+        );
+        assert_eq!(permission_label("shop_api_write"), "api write");
+        assert_eq!(permission_label("email_send"), "email send");
     }
 
     #[test]

@@ -12,12 +12,12 @@ use connectors::{
 use llm::{ChatMessage, LlmError, LlmProvider, ProviderConfig, ProviderId, Usage};
 use skills::{ScriptLimits, Skill};
 use store::Store;
-use tools::{CancellationToken, Tool, ToolContext, ToolRegistry};
+use tools::{CancellationToken, Mutability, Tool, ToolContext, ToolRegistry};
 
 use chrono::NaiveDateTime;
 
 use crate::agent::{
-    Agent, AgentConfig, AgentEvent, AuditEntry, AuditSink, AuditStage, AutoDeny, UiGate,
+    Agent, AgentConfig, AgentEvent, AuditEntry, AuditSink, AuditStage, TaskGate, UiGate,
 };
 use crate::prompt::{system_prompt, PromptContext};
 use crate::redact::Redactor;
@@ -57,6 +57,9 @@ pub enum Command {
         name: String,
         prompt: String,
         schedule: String,
+        /// Changing tools or `tool:action` pairs the merchant confirmed the
+        /// task may use without asking; empty keeps it read-only.
+        allowed_tools: Vec<String>,
     },
     SetTaskEnabled {
         id: i64,
@@ -103,6 +106,7 @@ pub struct TaskSummary {
     pub schedule: String,
     pub enabled: bool,
     pub last_run_at: Option<String>,
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +174,9 @@ pub enum BackendEvent {
     Skills(Vec<SkillSummary>),
     /// Scheduled tasks of the active shop.
     Tasks(Vec<TaskSummary>),
+    /// What a new task of the active shop could be allowed to do without
+    /// asking: changing tools, or `tool:action` for tools with actions.
+    TaskPermissions(Vec<String>),
     TaskFinished {
         name: String,
         error: Option<String>,
@@ -323,7 +330,7 @@ impl AuditSink for StoreAudit {
     fn record(&self, entry: AuditEntry) {
         let (stage, detail) = match entry.stage {
             AuditStage::Denied(reason) => ("denied", reason),
-            AuditStage::Approved => ("approved", None),
+            AuditStage::Approved(by) => ("approved", by),
             AuditStage::Succeeded(summary) => ("succeeded", Some(summary)),
             AuditStage::Failed(error) => ("failed", Some(error)),
         };
@@ -535,7 +542,8 @@ impl Backend {
                 name,
                 prompt,
                 schedule,
-            } => self.create_task(&name, &prompt, &schedule),
+                allowed_tools,
+            } => self.create_task(&name, &prompt, &schedule, allowed_tools),
             Command::SetTaskEnabled { id, enabled } => self
                 .store
                 .set_task_enabled(id, enabled)
@@ -1128,6 +1136,18 @@ fn local_to_rfc3339(t: NaiveDateTime) -> String {
 
 const UNATTENDED_NOTE: &str = "\n\nThis is a scheduled task running unattended; the merchant is not watching. You cannot change the shop: report what you find and what you would recommend.";
 
+fn unattended_note(allowed: &[String]) -> String {
+    if allowed.is_empty() {
+        return UNATTENDED_NOTE.to_string();
+    }
+    format!(
+        "\n\nThis is a scheduled task running unattended; the merchant is not watching. \
+The merchant allowed this task to use only these without asking: {}. \
+Any other change or message is refused: report it and what you would recommend instead.",
+        allowed.join(", ")
+    )
+}
+
 impl Backend {
     fn emit_tasks(&self) -> Res<()> {
         let tasks = match self.active_shop_id() {
@@ -1144,10 +1164,34 @@ impl Backend {
                     schedule: t.schedule,
                     enabled: t.enabled,
                     last_run_at: t.last_run_at,
+                    allowed_tools: t.allowed_tools,
                 })
                 .collect(),
         ));
+        self.emit(BackendEvent::TaskPermissions(self.task_permissions()));
         Ok(())
+    }
+
+    fn task_permissions(&self) -> Vec<String> {
+        if self.shop.is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for def in self.tools.definitions() {
+            if def.mutability != Mutability::Mutate {
+                continue;
+            }
+            match def.parameters["properties"]["action"]["enum"].as_array() {
+                Some(actions) => out.extend(
+                    actions
+                        .iter()
+                        .filter_map(|a| a.as_str())
+                        .map(|a| format!("{}:{a}", def.name)),
+                ),
+                None => out.push(def.name),
+            }
+        }
+        out
     }
 
     fn load_audit(&self) -> Res<()> {
@@ -1170,7 +1214,13 @@ impl Backend {
         Ok(())
     }
 
-    fn create_task(&mut self, name: &str, prompt: &str, schedule: &str) -> Res<()> {
+    fn create_task(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        schedule: &str,
+        allowed_tools: Vec<String>,
+    ) -> Res<()> {
         let shop_id = self
             .active_shop_id()
             .ok_or("Connect a shop before scheduling tasks.")?;
@@ -1179,12 +1229,19 @@ impl Backend {
             return Err("A task needs a name and a prompt.".into());
         }
         let schedule: Schedule = schedule.parse()?;
+        let options = self.task_permissions();
+        if let Some(unknown) = allowed_tools.iter().find(|a| !options.contains(a)) {
+            return Err(format!(
+                "{unknown:?} is not something this shop's tasks can be allowed to do."
+            ));
+        }
         self.store
             .create_task(&store::NewTask {
                 shop_id,
                 name: name.into(),
                 prompt: prompt.into(),
                 schedule: schedule.to_string(),
+                allowed_tools,
             })
             .map_err(err)?;
         self.emit_tasks()
@@ -1280,18 +1337,23 @@ impl Backend {
             cancel: CancellationToken::new(),
         };
         let prompt = format!(
-            "{}{UNATTENDED_NOTE}",
+            "{}{}",
             system_prompt(&self.prompt_context_for(
                 Some(shop.id),
                 Some(shop.url.clone()),
                 shop.name.clone(),
                 &connectors,
-            ))
+            )),
+            unattended_note(&task.allowed_tools)
         );
+        let gate = TaskGate {
+            task: task.name.clone(),
+            allowed: task.allowed_tools.clone(),
+        };
         let agent = Agent {
             provider: provider.as_ref(),
             tools: &tools,
-            gate: &AutoDeny,
+            gate: &gate,
             audit: &audit,
             sink,
             config: &config,
@@ -2073,6 +2135,7 @@ mod tests {
                 name: "Morning".into(),
                 prompt: "Summarise yesterday".into(),
                 schedule: schedule.into(),
+                allowed_tools: Vec::new(),
             })
             .await;
         f.store.list_tasks(None).unwrap()[0].id
@@ -2155,6 +2218,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tasks_can_only_be_allowed_changes_the_shop_offers() {
+        let mut f = fixture();
+        f.configure().await;
+        f.connect("a.test", Platform::PrestaShop).await;
+        let options = f
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                BackendEvent::TaskPermissions(p) => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        assert!(options.contains(&"shop_manage_order:add_note".to_string()));
+        assert!(options.contains(&"shop_api_write".to_string()));
+        assert!(options.contains(&"memory_save".to_string()));
+        assert!(!options.iter().any(|o| o.starts_with("shop_list_")));
+        let create = |allowed: &[&str]| Command::CreateTask {
+            name: "Reminders".into(),
+            prompt: "Remind unpaid orders".into(),
+            schedule: "daily 10:00".into(),
+            allowed_tools: allowed.iter().map(|a| a.to_string()).collect(),
+        };
+        f.backend
+            .handle(create(&["shop_manage_order:explode"]))
+            .await;
+        assert!(matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("explode")));
+        assert!(f.store.list_tasks(None).unwrap().is_empty());
+        f.backend
+            .handle(create(&["shop_manage_order:add_note"]))
+            .await;
+        assert_eq!(
+            f.store.list_tasks(None).unwrap()[0].allowed_tools,
+            ["shop_manage_order:add_note"]
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_tasks_make_only_their_allowed_changes() {
+        let mut f = fixture();
+        f.configure().await;
+        f.connect("a.test", Platform::PrestaShop).await;
+        f.backend
+            .handle(Command::CreateTask {
+                name: "Reminders".into(),
+                prompt: "Remind unpaid orders".into(),
+                schedule: "every 6h".into(),
+                allowed_tools: vec!["shop_manage_order:add_note".into()],
+            })
+            .await;
+        let id = f.store.list_tasks(None).unwrap()[0].id;
+        f.provider
+            .push_tool_call(
+                "c1",
+                "shop_manage_order",
+                json!({"action": "add_note", "id": "1", "note": "Payment reminder sent"}),
+            )
+            .push_tool_call(
+                "c2",
+                "shop_manage_product",
+                json!({"action": "delete", "id": "7"}),
+            )
+            .push_text("Noted order 1; I would also delete product 7");
+        f.backend.handle(Command::RunTaskNow(id)).await;
+
+        let req = &f.provider.requests()[0];
+        assert!(
+            matches!(&req.messages[0], ChatMessage::System { text } if text.contains("use only these without asking: shop_manage_order:add_note"))
+        );
+        let mut audit = f.store.audit_log(None, 10).unwrap();
+        audit.reverse();
+        let rows: Vec<_> = audit
+            .iter()
+            .map(|a| (a.tool.as_str(), a.stage.as_str()))
+            .collect();
+        assert_eq!(rows[0], ("shop_manage_order", "approved"), "{audit:?}");
+        assert_eq!(
+            audit[0].detail.as_deref(),
+            Some("allowed by scheduled task \"Reminders\"")
+        );
+        assert_eq!(rows.last(), Some(&("shop_manage_product", "denied")));
+    }
+
+    #[tokio::test]
     async fn invalid_schedules_and_shopless_tasks_are_rejected() {
         let mut f = fixture();
         f.backend
@@ -2162,6 +2309,7 @@ mod tests {
                 name: "x".into(),
                 prompt: "y".into(),
                 schedule: "daily 09:00".into(),
+                allowed_tools: Vec::new(),
             })
             .await;
         assert!(
@@ -2173,6 +2321,7 @@ mod tests {
                 name: "x".into(),
                 prompt: "y".into(),
                 schedule: "sometimes".into(),
+                allowed_tools: Vec::new(),
             })
             .await;
         assert!(

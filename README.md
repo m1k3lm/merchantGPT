@@ -14,7 +14,7 @@ It is a native Rust application for macOS, Linux and Windows. There is no accoun
 - **Memory.** The assistant can save short notes about you or your shop (for example "we ship on Mondays") and uses them in later chats. Saving a note also asks for approval.
 - **Skills.** Reusable instructions in a skills folder, run by typing `/skill-name` in the chat. A daily sales summary skill is installed on first run.
 - **Google Ads drafts.** Link a Google Ads account to a shop with **+ > Google Ads > Sign in with Google**. The assistant can then list campaigns with recent results and draft complete Search campaigns (budget, ad group, responsive search ad, keywords, countries). Drafts are always created paused: nothing runs or spends until you enable them in Google Ads.
-- **Scheduled tasks.** Run a prompt or a skill daily, weekly or every few hours. Scheduled runs can read the shop but never change it; their reports appear in a "Task: ..." chat.
+- **Scheduled tasks.** Run a prompt or a skill daily, weekly or every few hours. By default a task only reads and reports, in a "Task: ..." chat. To let it act on its own (for example send payment reminders or add order notes), tick those actions when you create it and confirm; it can then do exactly those without asking, never anything else, and every change appears under **Activity**.
 
 ### Supported platforms and AI providers
 

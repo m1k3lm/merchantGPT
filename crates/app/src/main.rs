@@ -53,6 +53,39 @@ enum ConnectorFlow {
 }
 
 #[derive(Default)]
+struct NewTaskForm {
+    name: String,
+    prompt: String,
+    schedule: String,
+    /// Changes the task may make without asking, ticked by the merchant.
+    allowed: std::collections::BTreeSet<String>,
+    /// Showing the "allow these unattended changes?" confirmation.
+    confirming: bool,
+}
+
+impl NewTaskForm {
+    /// Creates a read-only task directly; one with allowed changes asks for
+    /// confirmation first.
+    fn create(&mut self) -> Option<Command> {
+        if self.allowed.is_empty() {
+            Some(self.command())
+        } else {
+            self.confirming = true;
+            None
+        }
+    }
+
+    fn command(&self) -> Command {
+        Command::CreateTask {
+            name: self.name.clone(),
+            prompt: self.prompt.clone(),
+            schedule: self.schedule.clone(),
+            allowed_tools: self.allowed.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Default)]
 struct GoogleAdsForm {
     show_setup: bool,
     client_id: String,
@@ -77,11 +110,7 @@ enum Dialog {
         id: i64,
         title: String,
     },
-    NewTask {
-        name: String,
-        prompt: String,
-        schedule: String,
-    },
+    NewTask(NewTaskForm),
     DeleteTask {
         id: i64,
         name: String,
@@ -397,11 +426,10 @@ impl App {
                         ui.strong("Tasks");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("New").clicked() {
-                                self.dialog = Dialog::NewTask {
-                                    name: String::new(),
-                                    prompt: String::new(),
+                                self.dialog = Dialog::NewTask(NewTaskForm {
                                     schedule: "daily 09:00".into(),
-                                };
+                                    ..Default::default()
+                                });
                             }
                         });
                     });
@@ -412,8 +440,23 @@ impl App {
                                 cmds.push(Command::SetTaskEnabled { id: t.id, enabled });
                             }
                             let last = t.last_run_at.as_deref().unwrap_or("never");
-                            let resp = ui.label(&t.name).on_hover_text(format!(
-                                "{}\nLast run: {last}\n\n{}",
+                            let may = if t.allowed_tools.is_empty() {
+                                "Read-only: asks for nothing, changes nothing.".to_string()
+                            } else {
+                                let labels: Vec<_> = t
+                                    .allowed_tools
+                                    .iter()
+                                    .map(|k| state::permission_label(k))
+                                    .collect();
+                                format!("May do without asking: {}", labels.join(", "))
+                            };
+                            let label = if t.allowed_tools.is_empty() {
+                                RichText::new(&t.name)
+                            } else {
+                                RichText::new(format!("{} ⚡", t.name))
+                            };
+                            let resp = ui.label(label).on_hover_text(format!(
+                                "{}\nLast run: {last}\n{may}\n\n{}",
                                 t.schedule, t.prompt
                             ));
                             resp.context_menu(|ui| {
@@ -880,50 +923,10 @@ impl App {
                         });
                     });
             }
-            Dialog::NewTask {
-                name,
-                prompt,
-                schedule,
-            } => {
-                egui::Window::new("New scheduled task")
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        if ui.small_button("Use preset: daily sales summary").clicked() {
-                            *name = "Daily sales summary".into();
-                            *prompt = "/daily-sales-summary".into();
-                            *schedule = "daily 09:00".into();
-                        }
-                        ui.label("Name");
-                        ui.text_edit_singleline(name);
-                        ui.label("What should the assistant do? (a /skill works too)");
-                        ui.add(egui::TextEdit::multiline(prompt).desired_rows(3));
-                        ui.label("Schedule");
-                        ui.add(
-                            egui::TextEdit::singleline(schedule)
-                                .hint_text("daily 09:00 · weekly mon 08:30 · every 6h"),
-                        );
-                        let parsed = schedule.parse::<chat_core::scheduler::Schedule>();
-                        if let Err(e) = &parsed {
-                            ui.colored_label(RED, e);
-                        }
-                        ui.weak("Scheduled runs can read your shop but never change it.");
-                        ui.horizontal(|ui| {
-                            let ready = parsed.is_ok()
-                                && !name.trim().is_empty()
-                                && !prompt.trim().is_empty();
-                            if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
-                                cmd = Some(Command::CreateTask {
-                                    name: name.clone(),
-                                    prompt: prompt.clone(),
-                                    schedule: schedule.clone(),
-                                });
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
+            Dialog::NewTask(form) => {
+                let (done, command) = new_task_window(ctx, form, &self.state.task_permissions);
+                close = done;
+                cmd = command;
             }
             Dialog::DeleteTask { id, name } => {
                 egui::Window::new("Delete task").resizable(false).show(ctx, |ui| {
@@ -967,6 +970,107 @@ impl App {
 
 /// The Google Ads connector: one-time app setup, then "Sign in with Google",
 /// then the account to link. Returns whether to close and a command to send.
+/// The new-task form. Allowed changes need a second, explicit confirmation
+/// listing exactly what the task may do unattended.
+fn new_task_window(
+    ctx: &egui::Context,
+    form: &mut NewTaskForm,
+    options: &[String],
+) -> (bool, Option<Command>) {
+    let (mut close, mut cmd) = (false, None);
+    if form.confirming {
+        egui::Window::new("Allow unattended changes?")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "\"{}\" runs on its own, with nobody watching. Every run may do these without asking you:",
+                    form.name.trim()
+                ));
+                for key in &form.allowed {
+                    ui.label(RichText::new(format!("• {}", state::permission_label(key))).strong());
+                }
+                ui.colored_label(
+                    AMBER,
+                    "Text the task reads (customer notes, product descriptions) could try to misuse these permissions. Allow only what the task needs. Every change is recorded in Activity.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Allow and create").color(RED)).clicked() {
+                        cmd = Some(form.command());
+                        close = true;
+                    }
+                    if ui.button("Back").clicked() {
+                        form.confirming = false;
+                    }
+                });
+            });
+        return (close, cmd);
+    }
+    egui::Window::new("New scheduled task")
+        .resizable(false)
+        .show(ctx, |ui| {
+            if ui.small_button("Use preset: daily sales summary").clicked() {
+                form.name = "Daily sales summary".into();
+                form.prompt = "/daily-sales-summary".into();
+                form.schedule = "daily 09:00".into();
+            }
+            ui.label("Name");
+            ui.text_edit_singleline(&mut form.name);
+            ui.label("What should the assistant do? (a /skill works too)");
+            ui.add(egui::TextEdit::multiline(&mut form.prompt).desired_rows(3));
+            ui.label("Schedule");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.schedule)
+                    .hint_text("daily 09:00 · weekly mon 08:30 · every 6h"),
+            );
+            let parsed = form.schedule.parse::<chat_core::scheduler::Schedule>();
+            if let Err(e) = &parsed {
+                ui.colored_label(RED, e);
+            }
+            egui::CollapsingHeader::new(format!(
+                "Allowed without asking ({})",
+                form.allowed.len()
+            ))
+            .id_salt("task-permissions")
+            .show(ui, |ui| {
+                ui.weak("By default a task only reads and reports. Tick what it may change or send on its own.");
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for key in options {
+                            let mut on = form.allowed.contains(key);
+                            if ui
+                                .checkbox(&mut on, state::permission_label(key))
+                                .on_hover_text(key)
+                                .changed()
+                            {
+                                if on {
+                                    form.allowed.insert(key.clone());
+                                } else {
+                                    form.allowed.remove(key);
+                                }
+                            }
+                        }
+                    });
+            });
+            if form.allowed.is_empty() {
+                ui.weak("This task can read your shop but never change it.");
+            }
+            ui.horizontal(|ui| {
+                let ready = parsed.is_ok()
+                    && !form.name.trim().is_empty()
+                    && !form.prompt.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
+                    cmd = form.create();
+                    close = cmd.is_some();
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+    (close, cmd)
+}
+
 /// The credential form of an email or marketing service; returns whether to
 /// close and the command to send.
 fn service_window(
@@ -1301,6 +1405,40 @@ mod tests {
             out.textures_delta.clear();
         }
         result
+    }
+
+    #[test]
+    fn tasks_with_allowed_changes_need_a_second_confirmation() {
+        let mut read_only = NewTaskForm {
+            name: "Report".into(),
+            prompt: "Summarise".into(),
+            schedule: "daily 09:00".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            read_only.create(),
+            Some(Command::CreateTask { allowed_tools, .. }) if allowed_tools.is_empty()
+        ));
+
+        let mut form = NewTaskForm {
+            allowed: ["shop_manage_order:add_note".to_string()].into(),
+            ..read_only
+        };
+        assert!(form.create().is_none());
+        assert!(form.confirming);
+        let options = vec!["shop_manage_order:add_note".to_string()];
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let (close, cmd) = new_task_window(ui.ctx(), &mut form, &options);
+                assert!(!close && cmd.is_none(), "nothing is created until Allow");
+            });
+            out.textures_delta.clear();
+        }
+        assert!(matches!(
+            form.command(),
+            Command::CreateTask { allowed_tools, .. } if allowed_tools == ["shop_manage_order:add_note"]
+        ));
     }
 
     #[test]

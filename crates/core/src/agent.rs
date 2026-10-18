@@ -100,6 +100,18 @@ pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 #[async_trait]
 pub trait ConfirmationGate: Send + Sync {
     async fn confirm(&self, call: &ToolCall, def: &ToolDefinition) -> Decision;
+
+    /// Whether the gate may decide unattended runs. Only a gate built from
+    /// the merchant's standing permission does; every other gate is replaced
+    /// by a denial there.
+    fn decides_unattended(&self) -> bool {
+        false
+    }
+
+    /// Who approved, for the audit log when it was not the merchant live.
+    fn approved_by(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct AlwaysApprove;
@@ -120,6 +132,52 @@ impl ConfirmationGate for AutoDeny {
         Decision::Deny(Some(
             "unattended runs cannot change the shop; tell the merchant what you would do".into(),
         ))
+    }
+}
+
+/// A scheduled task's unattended runs: approves only the changing tools and
+/// `tool:action` pairs the merchant allowed when creating the task, so data
+/// read during the run cannot steer it into anything else.
+pub struct TaskGate {
+    pub task: String,
+    pub allowed: Vec<String>,
+}
+
+impl TaskGate {
+    pub fn allows(&self, call: &ToolCall) -> bool {
+        let action = call
+            .arguments
+            .get("action")
+            .and_then(serde_json::Value::as_str);
+        self.allowed.iter().any(|a| match a.split_once(':') {
+            None => *a == call.name,
+            Some((tool, act)) => tool == call.name && Some(act) == action,
+        })
+    }
+}
+
+#[async_trait]
+impl ConfirmationGate for TaskGate {
+    async fn confirm(&self, call: &ToolCall, _: &ToolDefinition) -> Decision {
+        if self.allows(call) {
+            return Decision::Approve;
+        }
+        let allowed = if self.allowed.is_empty() {
+            "change nothing".to_string()
+        } else {
+            format!("use only {}", self.allowed.join(", "))
+        };
+        Decision::Deny(Some(format!(
+            "this scheduled task may {allowed}; tell the merchant what you would do"
+        )))
+    }
+
+    fn decides_unattended(&self) -> bool {
+        true
+    }
+
+    fn approved_by(&self) -> Option<String> {
+        Some(format!("allowed by scheduled task \"{}\"", self.task))
     }
 }
 
@@ -151,7 +209,8 @@ impl ConfirmationGate for UiGate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditStage {
     Denied(Option<String>),
-    Approved,
+    /// Carries who approved when it was not the merchant at the card.
+    Approved(Option<String>),
     Succeeded(String),
     Failed(String),
 }
@@ -421,8 +480,10 @@ impl Agent<'_> {
         let def = tool.definition();
         let mutating = def.mutability == Mutability::Mutate;
         if mutating {
-            let decision = if ctx.unattended {
+            let decision = if ctx.unattended && !self.gate.decides_unattended() {
                 AutoDeny.confirm(call, &def).await
+            } else if ctx.unattended {
+                self.gate.confirm(call, &def).await
             } else {
                 self.guarded(ctx, deadline, self.gate.confirm(call, &def))
                     .await?
@@ -440,7 +501,7 @@ impl Agent<'_> {
                 });
                 return Ok(result);
             }
-            self.audit(call, AuditStage::Approved);
+            self.audit(call, AuditStage::Approved(self.gate.approved_by()));
         }
 
         (self.sink)(AgentEvent::ToolStarted {
@@ -491,7 +552,7 @@ impl Agent<'_> {
         let r = &self.redactor;
         let stage = match stage {
             AuditStage::Denied(reason) => AuditStage::Denied(reason.map(|x| r.apply(&x))),
-            AuditStage::Approved => AuditStage::Approved,
+            AuditStage::Approved(by) => AuditStage::Approved(by),
             AuditStage::Succeeded(x) => AuditStage::Succeeded(r.apply(&x)),
             AuditStage::Failed(x) => AuditStage::Failed(r.apply(&x)),
         };
@@ -716,10 +777,48 @@ mod tests {
         assert_eq!(
             stages,
             vec![
-                AuditStage::Approved,
+                AuditStage::Approved(None),
                 AuditStage::Succeeded("changed:{}".into())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn task_gates_allow_only_what_the_merchant_allowed() {
+        let h = Harness::new();
+        h.provider
+            .push_tool_call("c1", "change_thing", json!({"action": "note"}))
+            .push_tool_call("c2", "change_thing", json!({"action": "delete"}))
+            .push_text("Noted; I would also delete it");
+        let mut history = user("note it, then delete it");
+        let ctx = ToolContext {
+            unattended: true,
+            ..Default::default()
+        };
+        let gate = TaskGate {
+            task: "Nightly".into(),
+            allowed: vec!["change_thing:note".into()],
+        };
+        h.run(&gate, &mut history, &ctx).await.unwrap();
+        let results = tool_results(&history);
+        assert!(!results[0].is_error, "{}", results[0].content);
+        assert!(results[1].is_error);
+        assert!(results[1]
+            .content
+            .contains("may use only change_thing:note"));
+        let stages: Vec<_> = h
+            .rec
+            .audit
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.stage.clone())
+            .collect();
+        assert_eq!(
+            stages[0],
+            AuditStage::Approved(Some("allowed by scheduled task \"Nightly\"".into()))
+        );
+        assert!(matches!(stages.last(), Some(AuditStage::Denied(_))));
     }
 
     #[tokio::test]

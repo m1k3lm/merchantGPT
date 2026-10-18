@@ -125,7 +125,7 @@ Requested after the four shop connectors existed: create, modify and delete orde
 - Mailchimp: audiences, upsert members (subscriber hash is the md5 of the lowercased email; `status_if_new` is a required argument), create and send campaigns.
 - Klaviyo: lists, subscribe profiles with explicit consent, campaigns (scope to what the current revision allows without a deep template flow, and say so).
 - Consent: marketing messages only to customers who opted in (`accepts_marketing`, or the consent the merchant states); messages about a customer's own order or cart are transactional. Bulk tools take an explicit consent or status argument, never defaulted to "subscribed". The system prompt states the rule.
-- Out of scope, a decision for the merchant: automatic reminders. Scheduled runs use `AutoDeny`, so nothing unattended can send.
+- Automatic reminders (merchant decision, 2026-10-18): a scheduled task may change or send only what the merchant ticked and confirmed when creating it (`TaskGate` over `scheduled_tasks.allowed_tools`); everything else stays denied.
 
 ## Plumbing
 

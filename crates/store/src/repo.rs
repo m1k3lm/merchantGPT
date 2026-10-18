@@ -70,6 +70,8 @@ pub struct NewTask {
     pub name: String,
     pub prompt: String,
     pub schedule: String,
+    /// Changing tools or `tool:action` pairs the task may use unattended.
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,7 @@ pub struct TaskRow {
     pub last_run_at: Option<String>,
     pub conversation_id: Option<i64>,
     pub created_at: String,
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,13 +143,15 @@ fn task_row(r: &Row) -> rusqlite::Result<TaskRow> {
         last_run_at: r.get(6)?,
         conversation_id: r.get(7)?,
         created_at: r.get(8)?,
+        // A malformed value grants nothing.
+        allowed_tools: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
     })
 }
 
 const SHOP_COLS: &str = "id, url, name, created_at, last_used_at";
 const CONV_COLS: &str = "id, shop_id, title, input_tokens, output_tokens, created_at, updated_at";
 const TASK_COLS: &str =
-    "id, shop_id, name, prompt, schedule, enabled, last_run_at, conversation_id, created_at";
+    "id, shop_id, name, prompt, schedule, enabled, last_run_at, conversation_id, created_at, allowed_tools";
 
 impl Store {
     // --- shops -----------------------------------------------------------
@@ -476,9 +481,16 @@ impl Store {
     pub fn create_task(&self, t: &NewTask) -> Result<i64> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO scheduled_tasks (shop_id, name, prompt, schedule, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![t.shop_id, t.name, t.prompt, t.schedule, now()],
+            "INSERT INTO scheduled_tasks (shop_id, name, prompt, schedule, created_at, allowed_tools)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                t.shop_id,
+                t.name,
+                t.prompt,
+                t.schedule,
+                now(),
+                serde_json::to_string(&t.allowed_tools).expect("strings serialize")
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -678,6 +690,7 @@ mod tests {
                 name: "Daily sales".into(),
                 prompt: "Summarise yesterday".into(),
                 schedule: "daily 09:00".into(),
+                allowed_tools: vec!["email_send".into(), "shop_manage_order:add_note".into()],
             })
             .unwrap();
         s.mark_task_run(t, "2026-10-17T09:00:00Z", None).unwrap();
@@ -685,6 +698,10 @@ mod tests {
         let row = &s.list_tasks(Some(shop)).unwrap()[0];
         assert_eq!(row.last_run_at.as_deref(), Some("2026-10-17T09:00:00Z"));
         assert!(!row.enabled);
+        assert_eq!(
+            row.allowed_tools,
+            ["email_send", "shop_manage_order:add_note"]
+        );
         assert_eq!(s.list_tasks(None).unwrap().len(), 1);
 
         s.record_audit(&NewAudit {
