@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod backend;
 pub mod config;
+pub mod guard;
 pub mod memory;
 pub mod prompt;
 pub mod redact;

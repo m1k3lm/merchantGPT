@@ -66,6 +66,8 @@ pub struct AppState {
     pub google_sign_in: GoogleSignInState,
     /// What a new task of the active shop could be allowed to do unattended.
     pub task_permissions: Vec<String>,
+    /// The merchant turned off the refusal of off-topic messages.
+    pub scope_guard_off: bool,
 }
 
 /// Calls that remove something for good, so the confirmation card can say so.
@@ -266,6 +268,7 @@ impl AppState {
             BackendEvent::Tasks(t) => self.tasks = t,
             BackendEvent::TaskPermissions(p) => self.task_permissions = p,
             BackendEvent::Audit(rows) => self.audit = rows,
+            BackendEvent::ScopeGuard(on) => self.scope_guard_off = !on,
             BackendEvent::GoogleAdsApp {
                 configured,
                 client_id,
@@ -352,6 +355,16 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_guard_starts_on_and_follows_the_backend() {
+        let mut s = AppState::default();
+        assert!(!s.scope_guard_off);
+        s.apply(BackendEvent::ScopeGuard(false));
+        assert!(s.scope_guard_off);
+        s.apply(BackendEvent::ScopeGuard(true));
+        assert!(!s.scope_guard_off);
+    }
 
     #[test]
     fn deletes_are_recognised_as_irreversible() {

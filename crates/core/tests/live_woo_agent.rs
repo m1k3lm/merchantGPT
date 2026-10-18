@@ -82,6 +82,8 @@ async fn agent_reads_and_changes_a_live_store() {
         Arc::new(ReqwestTransport::new(http)),
         store.clone(),
     );
+    // The scripted replies are the agent's; the off-topic check would take one.
+    backend.handle(Command::SetScopeGuard(false)).await;
     backend
         .handle(Command::SetLlm(ProviderConfig {
             options: Default::default(),

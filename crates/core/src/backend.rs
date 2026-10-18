@@ -28,6 +28,8 @@ pub enum Command {
     /// Restores the active LLM, the most recent shop and its last conversation.
     Init,
     SetLlm(ProviderConfig),
+    /// Turns the off-topic guard on or off; saved across restarts.
+    SetScopeGuard(bool),
     ConnectShop {
         url: String,
         kind: ConnectorKind,
@@ -182,6 +184,8 @@ pub enum BackendEvent {
         error: Option<String>,
     },
     Audit(Vec<AuditSummary>),
+    /// Whether off-topic messages are refused before reaching the assistant.
+    ScopeGuard(bool),
     /// Whether the Google Ads app credentials are set up (secrets never sent).
     GoogleAdsApp {
         configured: bool,
@@ -237,6 +241,7 @@ pub struct Backend {
     google_sign_in: Option<CancellationToken>,
     google_pending: Option<GooglePending>,
     google_built_in: GoogleApp,
+    scope_guard: bool,
 }
 
 /// A finished Google sign-in waiting for the merchant to pick an account.
@@ -393,7 +398,15 @@ impl Backend {
             google_sign_in: None,
             google_pending: None,
             google_built_in: GoogleApp::built_in(),
+            scope_guard: true,
         };
+        backend.scope_guard = backend
+            .store
+            .app_setting(SCOPE_GUARD_SETTING)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("off");
         backend.rebuild_tools();
         backend
     }
@@ -498,6 +511,7 @@ impl Backend {
     pub async fn handle(&mut self, cmd: Command) {
         let result = match cmd {
             Command::Init => self.init(),
+            Command::SetScopeGuard(on) => self.set_scope_guard(on),
             Command::SetLlm(cfg) => self
                 .with_saved_key(cfg)
                 .and_then(|cfg| self.set_llm(cfg, true)),
@@ -600,6 +614,7 @@ impl Backend {
 
     fn init(&mut self) -> Res<()> {
         self.emit_google_app()?;
+        self.emit(BackendEvent::ScopeGuard(self.scope_guard));
         self.emit(BackendEvent::Skills(
             self.skills
                 .iter()
@@ -1034,7 +1049,62 @@ impl Backend {
                 .map(|s| (s.name.clone(), s.description.clone()))
                 .collect(),
             memory: notes.into_iter().skip(skip).map(|n| n.text).collect(),
+            scope_guard: self.scope_guard,
         }
+    }
+
+    fn set_scope_guard(&mut self, on: bool) -> Res<()> {
+        self.store
+            .set_app_setting(SCOPE_GUARD_SETTING, if on { "on" } else { "off" })
+            .map_err(err)?;
+        self.scope_guard = on;
+        self.emit(BackendEvent::ScopeGuard(on));
+        Ok(())
+    }
+
+    /// Answers an off-topic message with a fixed refusal, without running the
+    /// agent. Skill commands are the merchant's own and skip the check.
+    async fn refused_off_topic(
+        &mut self,
+        provider: &dyn LlmProvider,
+        model: &str,
+        text: &str,
+        conversation: i64,
+    ) -> Res<bool> {
+        if !self.scope_guard || text.trim_start().starts_with('/') {
+            return Ok(false);
+        }
+        let previous = self.history.iter().rev().find_map(|m| match m {
+            ChatMessage::Assistant { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        });
+        let (verdict, usage) = crate::guard::check(provider, model, previous, text).await;
+        if verdict == crate::guard::Verdict::InScope {
+            self.store
+                .add_usage(conversation, usage.input_tokens, usage.output_tokens)
+                .map_err(err)?;
+            return Ok(false);
+        }
+        let exchange = [
+            ChatMessage::user(text),
+            ChatMessage::assistant(crate::guard::REFUSAL),
+        ];
+        self.emit(BackendEvent::Agent(AgentEvent::TextDelta(
+            crate::guard::REFUSAL.into(),
+        )));
+        let rows: Vec<String> = exchange
+            .iter()
+            .filter_map(|m| serde_json::to_string(m).ok())
+            .collect();
+        self.history.extend(exchange);
+        self.store
+            .append_messages(conversation, &rows)
+            .map_err(err)?;
+        self.store
+            .add_usage(conversation, usage.input_tokens, usage.output_tokens)
+            .map_err(err)?;
+        self.emit_conversations()?;
+        Ok(true)
     }
 
     async fn send(&mut self, text: String, cancel: CancellationToken) -> Res<()> {
@@ -1052,6 +1122,12 @@ impl Backend {
                 id
             }
         };
+        if self
+            .refused_off_topic(provider.as_ref(), &cfg.model, &text, conversation)
+            .await?
+        {
+            return Ok(());
+        }
         let first_new = self.history.len();
         let text = match skills::expand_command(&text, &self.skills) {
             Some(expanded) => format!("{}\n\n{expanded}", text.trim()),
@@ -1133,6 +1209,8 @@ fn local_to_rfc3339(t: NaiveDateTime) -> String {
         .unwrap_or_else(|| t.and_utc())
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
+
+const SCOPE_GUARD_SETTING: &str = "scope_guard";
 
 const UNATTENDED_NOTE: &str = "\n\nThis is a scheduled task running unattended; the merchant is not watching. You cannot change the shop: report what you find and what you would recommend.";
 
@@ -1686,6 +1764,8 @@ mod tests {
         );
         // Independent of credentials compiled in through release.env.
         backend.google_built_in = GoogleApp::default();
+        // Scripted replies are for the agent; guard tests turn it back on.
+        backend.scope_guard = false;
         Fixture {
             backend,
             events,
@@ -2214,6 +2294,79 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, BackendEvent::Agent(_))),
             "unattended runs do not stream into the open chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_topic_messages_get_the_refusal_without_running_the_agent() {
+        let mut f = fixture();
+        f.configure().await;
+        f.backend.scope_guard = true;
+        f.provider.push_text("OUT");
+        f.send("How do I treat a migraine?").await;
+        assert_eq!(f.provider.requests().len(), 1, "only the check ran");
+        assert!(f.provider.requests()[0].tools.is_empty());
+        assert!(matches!(
+            f.backend.history().last(),
+            Some(ChatMessage::Assistant { text, .. }) if text == crate::guard::REFUSAL
+        ));
+        assert!(f.events().iter().any(|e| matches!(
+            e,
+            BackendEvent::Agent(AgentEvent::TextDelta(t)) if t == crate::guard::REFUSAL
+        )));
+        let conv = f.backend.conversation_id().unwrap();
+        assert_eq!(f.store.messages(conv).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn merchant_messages_and_skill_commands_reach_the_agent() {
+        let mut f = fixture();
+        f.configure().await;
+        f.backend.scope_guard = true;
+        f.provider
+            .push_text("IN")
+            .push_text("Go to Products > Add product.")
+            .push_text("Summary");
+        f.send("How do I add a product in Shopify?").await;
+        let reqs = f.provider.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            matches!(&reqs[1].messages[0], ChatMessage::System { text } if text.contains("Scope: only merchant"))
+        );
+        f.send("/daily-sales-summary").await;
+        assert_eq!(
+            f.provider.requests().len(),
+            3,
+            "skill commands skip the check"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guard_setting_survives_a_restart() {
+        let store = Store::open_in_memory().unwrap();
+        let mut f = fixture_with(store.clone());
+        f.backend.handle(Command::SetScopeGuard(false)).await;
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::ScopeGuard(false))
+        ));
+        let restarted = Backend::new(
+            Arc::new(|_| {}),
+            Arc::new(|_| Err(LlmError::Auth("unused".into()))),
+            Arc::new(FakeTransport::new()),
+            store.clone(),
+        );
+        assert!(!restarted.scope_guard);
+        f.backend.handle(Command::SetScopeGuard(true)).await;
+        let restarted = Backend::new(
+            Arc::new(|_| {}),
+            Arc::new(|_| Err(LlmError::Auth("unused".into()))),
+            Arc::new(FakeTransport::new()),
+            store,
+        );
+        assert!(
+            restarted.scope_guard,
+            "on by default and when turned back on"
         );
     }
 

@@ -332,6 +332,18 @@ impl App {
                     if ui.button("Settings").clicked() {
                         self.open_settings();
                     }
+                    let guarded = !self.state.scope_guard_off;
+                    if ui
+                        .add(egui::Button::selectable(guarded, "Merchant topics only"))
+                        .on_hover_text(if guarded {
+                            "On: messages unrelated to your shop or e-commerce are declined. Click to allow any topic."
+                        } else {
+                            "Off: the assistant answers any topic. Click to keep it to your shop and e-commerce."
+                        })
+                        .clicked()
+                    {
+                        self.send(Command::SetScopeGuard(!guarded));
+                    }
                     if ui
                         .add_enabled(
                             self.state.active_shop.is_some(),
