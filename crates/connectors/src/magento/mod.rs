@@ -286,7 +286,7 @@ impl ShopConnector for Magento {
     }
 
     fn api_hint(&self) -> &'static str {
-        "Magento 2 REST: path relative to /rest, e.g. /V1/products (default store view) or /all/V1/products (all store views); searchCriteria goes in query; JSON bodies."
+        "Magento 2 REST: path relative to /rest, e.g. /V1/products (default store view) or /all/V1/products (all store views); searchCriteria goes in query; JSON bodies. Full orders are slow and large: list with searchCriteria[pageSize] of 50 or less and a `fields` query that names only what you need, e.g. fields=items[increment_id,grand_total,status],total_count. For totals per country or region use shop_sales_report with group_by."
     }
 
     async fn create_product(&self, p: &ProductPatch) -> Result<Product, ConnectorError> {
@@ -1074,6 +1074,15 @@ mod tests {
             .as_deref(),
             Some("canceled")
         );
+    }
+
+    #[test]
+    fn the_raw_api_hint_asks_for_small_pages_and_few_fields() {
+        let t = Arc::new(FakeTransport::new());
+        let hint = magento(&t).api_hint();
+        assert!(hint.contains("fields="), "{hint}");
+        assert!(hint.contains("pageSize"), "{hint}");
+        assert!(hint.contains("shop_sales_report with group_by"), "{hint}");
     }
 
     #[tokio::test]
