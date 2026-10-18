@@ -9,6 +9,7 @@ pub mod registry;
 pub mod schema;
 pub mod shop;
 pub mod shop_tools;
+pub mod shopify;
 pub mod stub;
 pub mod transport;
 pub mod woocommerce;

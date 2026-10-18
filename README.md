@@ -22,7 +22,8 @@ It is a native Rust application for macOS, Linux and Windows. There is no accoun
 |---|---|
 | WooCommerce | Supported, tested against a real store |
 | Magento 2 | Supported, tested against simulated responses only |
-| Shopify, PrestaShop | Can be added, but their operations report "not implemented yet" |
+| Shopify | Supported (GraphQL Admin API 2026-10), tested against simulated responses only |
+| PrestaShop | Can be added, but its operations report "not implemented yet" |
 
 | AI providers | Notes |
 |---|---|
@@ -89,6 +90,7 @@ Anything compiled into a desktop app can be extracted from the binary. The devel
 
 - **WooCommerce:** in the WordPress admin go to WooCommerce > Settings > Advanced > REST API, add a key with Read/Write permission, and copy the consumer key and secret. HTTPS stores use Basic auth; plain-HTTP stores are signed with OAuth 1.0a automatically.
 - **Magento 2:** go to System > Integrations, add an integration with API access to Catalog, Sales and Customers, activate it and copy the **Access Token** (the other three values are not used). On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" to Yes. Integration tokens do not expire; rotate one with **Reauthorize**.
+- **Shopify:** either paste the **Admin API access token** of a custom app made in the Shopify admin (Settings > Apps and sales channels > Develop apps; Shopify no longer lets you create new ones there since January 2026), or create an app in the Shopify **Dev Dashboard** under the organization that owns the store, give it the scopes `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_orders`, `write_orders` and `read_customers` (plus `read_all_orders` for orders older than 60 days), install it on the store and enter its **client ID and secret**. The app then fetches 24-hour tokens itself. If your shop URL is a custom domain, also enter the store's `myshopify.com` domain.
 
 ### Google Ads
 
@@ -192,7 +194,8 @@ docker volume rm merchantgpt_woo-db merchantgpt_woo-html
 
 ## Known limitations
 
-- Shopify and PrestaShop are placeholders.
-- The Magento and Google Ads connectors have not yet been verified against a live store or account.
+- PrestaShop is a placeholder.
+- The Magento, Shopify and Google Ads connectors have not yet been verified against a live store or account.
+- Shopify orders cannot be fulfilled from the assistant, and cancelling one does not refund it; do both in the Shopify admin.
 - Windows binaries are not produced yet; build on Windows directly or add a CI runner.
 - Shared or published builds must be hosted on seQura's `tech-ai-tools` S3 bucket (request access in Slack #ai-tools).

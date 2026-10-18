@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::magento::Magento;
 use crate::schema::CredentialField as F;
 use crate::shop::ShopConnectorAdapter;
+use crate::shopify::Shopify;
 use crate::stub::StubShop;
 use crate::woocommerce::WooCommerce;
 use crate::{
@@ -15,6 +16,8 @@ use crate::{
 pub struct ConnectorRegistry;
 
 const MAGENTO_HELP: &str = "In the Magento admin: System > Integrations > Add New Integration, give it API access to Catalog, Sales and Customers, save, then Activate and copy the Access Token. On Magento 2.4.4 or later also set Stores > Configuration > Services > OAuth > Consumer Settings > \"Allow OAuth Access Tokens to be used as standalone Bearer tokens\" to Yes.";
+
+const SHOPIFY_HELP: &str = "Use one of two kinds of app. An existing custom app made in the Shopify admin (Settings > Apps and sales channels > Develop apps): copy its Admin API access token; Shopify stopped allowing new ones there in January 2026. Or an app created in the Shopify Dev Dashboard by the organization that owns the store: give it the scopes read_products, write_products, read_inventory, write_inventory, read_orders, write_orders and read_customers (plus read_all_orders for orders older than 60 days), release a version, install it on the store, and copy its client ID and secret. If the shop URL is a custom domain, also enter the store's myshopify.com domain.";
 
 impl ConnectorRegistry {
     pub fn kinds() -> Vec<ConnectorKind> {
@@ -50,7 +53,18 @@ impl ConnectorRegistry {
                 ])
             }
             ConnectorKind::Shop(Platform::Shopify) => {
-                CredentialSchema::new(vec![F::secret("access_token", "Admin API access token")])
+                use crate::shopify as s;
+                CredentialSchema::new(vec![
+                    F::secret(s::ACCESS_TOKEN, "Admin API access token (custom app)").optional(),
+                    F::text(s::CLIENT_ID, "Client ID (Dev Dashboard app)").optional(),
+                    F::secret(s::CLIENT_SECRET, "Client secret (Dev Dashboard app)").optional(),
+                    F::text(
+                        s::SHOP_DOMAIN,
+                        "myshopify.com domain (only for a custom shop URL)",
+                    )
+                    .optional(),
+                ])
+                .with_help(SHOPIFY_HELP)
             }
         }
     }
@@ -81,6 +95,9 @@ impl ConnectorRegistry {
             }
             ConnectorKind::Shop(Platform::Magento) => {
                 Arc::new(Magento::new(base_url, credentials, transport))
+            }
+            ConnectorKind::Shop(Platform::Shopify) => {
+                Arc::new(Shopify::new(base_url, credentials, transport)?)
             }
             ConnectorKind::Shop(p) => Arc::new(StubShop(p)),
         };

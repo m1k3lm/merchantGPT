@@ -1609,10 +1609,25 @@ mod tests {
                 .await;
         }
 
+        /// Answers the platform's verify call; stub platforms need none.
+        fn accept_shop(&self, platform: Platform) {
+            use connectors::transport::{HttpResponse, Method};
+            if platform == Platform::Shopify {
+                self.transport.on(
+                    Method::Post,
+                    "/admin/api/2026-10/graphql.json",
+                    HttpResponse::new(200, r#"{"data":{"shop":{"name":"Test"}}}"#),
+                );
+            }
+        }
+
         async fn connect(&mut self, url: &str, platform: Platform) {
+            self.accept_shop(platform);
             let key = ConnectorRegistry::credential_schema(ConnectorKind::Shop(platform))
                 .fields()
                 .iter()
+                // Optional plain fields such as Shopify's domain would redirect the shop.
+                .filter(|f| f.required || f.secret)
                 .map(|f| (f.key.to_string(), "x".to_string()))
                 .collect();
             self.backend
@@ -1883,16 +1898,8 @@ mod tests {
         assert!(
             matches!(&req.messages[0], ChatMessage::System { text } if text.contains("https://a.test"))
         );
-        let result = f
-            .backend
-            .history()
-            .iter()
-            .find_map(|m| match m {
-                ChatMessage::ToolResults { results } => Some(results[0].content.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert!(result.contains("Shopify"), "{result}");
+        let shop_call = f.transport.requests().last().unwrap().url.clone();
+        assert!(shop_call.starts_with("https://a.test/"), "{shop_call}");
     }
 
     #[tokio::test]
@@ -2118,6 +2125,7 @@ mod tests {
     async fn error_events_never_contain_saved_secrets() {
         let mut f = fixture();
         f.configure().await;
+        f.accept_shop(Platform::Shopify);
         f.backend
             .handle(Command::ConnectShop {
                 url: "a.test".into(),
