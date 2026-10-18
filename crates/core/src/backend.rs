@@ -33,6 +33,11 @@ pub enum Command {
         kind: ConnectorKind,
         credentials: Credentials,
     },
+    /// Links an email or marketing service to the active shop.
+    ConnectService {
+        kind: ConnectorKind,
+        credentials: Credentials,
+    },
     SelectShop(i64),
     RemoveShop(i64),
     Send {
@@ -494,6 +499,9 @@ impl Backend {
                 kind,
                 credentials,
             } => self.connect_shop(&url, kind, &credentials).await,
+            Command::ConnectService { kind, credentials } => {
+                self.connect_service(kind, &credentials).await
+            }
             Command::SelectShop(id) => self.select_shop(id),
             Command::RemoveShop(id) => self.remove_shop(id),
             Command::Send { text, cancel } => {
@@ -711,6 +719,12 @@ impl Backend {
         kind: ConnectorKind,
         creds: &Credentials,
     ) -> Res<()> {
+        if !kind.is_shop() {
+            return Err(format!(
+                "{} is linked to a shop, not added as one.",
+                kind.display_name()
+            ));
+        }
         let url = normalize_shop_url(url)?;
         let connector =
             ConnectorRegistry::build(kind, &url, creds, self.transport.clone()).map_err(err)?;
@@ -730,6 +744,34 @@ impl Backend {
             kind.display_name()
         )));
         self.select_shop(row.id)
+    }
+
+    async fn connect_service(&mut self, kind: ConnectorKind, creds: &Credentials) -> Res<()> {
+        if !ConnectorKind::MAIL.contains(&kind) {
+            return Err(format!(
+                "{} is not connected this way.",
+                kind.display_name()
+            ));
+        }
+        let (shop_id, url) = self
+            .shop
+            .as_ref()
+            .map(|s| (s.id, s.url.clone()))
+            .ok_or("Connect a shop first: services are linked to a shop.")?;
+        let connector =
+            ConnectorRegistry::build(kind, &url, creds, self.transport.clone()).map_err(err)?;
+        connector
+            .verify()
+            .await
+            .map_err(|e| format!("Could not connect {}: {e}", kind.display_name()))?;
+        self.store
+            .save_credentials(shop_id, &kind.id(), creds)
+            .map_err(err)?;
+        self.emit(BackendEvent::Notice(format!(
+            "{} linked to this shop.",
+            kind.display_name()
+        )));
+        self.select_shop(shop_id)
     }
 
     fn shop_kind(&self, shop_id: i64) -> Res<Option<(ConnectorKind, Credentials)>> {
@@ -1733,7 +1775,16 @@ mod tests {
                 && shops[0].kind == Some(ConnectorKind::Shop(Platform::Shopify))
         )));
         assert_eq!(second.backend.history().len(), 2);
-        assert_eq!(second.backend.tools().len(), 8 + 3, "shop + memory tools");
+        let names: Vec<String> = second
+            .backend
+            .tools()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for tool in ["shop_list_orders", "shop_manage_product", "memory_save"] {
+            assert!(names.iter().any(|n| n == tool), "{tool} in {names:?}");
+        }
     }
 
     #[tokio::test]
@@ -1848,8 +1899,8 @@ mod tests {
         f.provider
             .push_tool_call(
                 "c1",
-                "shop_update_product",
-                json!({"id": "7", "regular_price": "9.90"}),
+                "shop_manage_product",
+                json!({"action": "update", "id": "7", "regular_price": "9.90"}),
             )
             .push_text("Tried");
         f.send("set price").await;
@@ -1858,8 +1909,11 @@ mod tests {
         log.reverse();
         let stages: Vec<_> = log.iter().map(|a| a.stage.as_str()).collect();
         assert_eq!(stages, ["approved", "failed"]);
-        assert_eq!(log[0].tool, "shop_update_product");
-        assert_eq!(log[0].arguments, r#"{"id":"7","regular_price":"9.90"}"#);
+        assert_eq!(log[0].tool, "shop_manage_product");
+        assert_eq!(
+            log[0].arguments,
+            r#"{"action":"update","id":"7","regular_price":"9.90"}"#
+        );
         assert_eq!(log[0].conversation_id, f.backend.conversation_id());
         assert!(log[1].detail.as_deref().unwrap().contains("product 7"));
     }
@@ -2084,8 +2138,8 @@ mod tests {
         f.provider
             .push_tool_call(
                 "c",
-                "shop_update_order_status",
-                json!({"id": "1", "status": "completed"}),
+                "shop_manage_order",
+                json!({"action": "update_status", "id": "1", "status": "completed"}),
             )
             .push_text("I would complete order 1");
         f.backend.handle(Command::RunTaskNow(id)).await;
@@ -2128,6 +2182,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn services_link_only_to_an_active_shop_and_only_when_they_verify() {
+        let mut f = fixture();
+        let brevo = Credentials::from([
+            ("api_key".into(), "xkeysib-secret".into()),
+            ("sender_email".into(), "shop@example.com".into()),
+        ]);
+        let connect = |kind| Command::ConnectService {
+            kind,
+            credentials: brevo.clone(),
+        };
+        f.backend.handle(connect(ConnectorKind::Brevo)).await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("Connect a shop first"))
+        );
+        f.connect("a.test", Platform::Shopify).await;
+        let shop = f.backend.active_shop_id().unwrap();
+        f.backend.handle(connect(ConnectorKind::GoogleAds)).await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not connected this way"))
+        );
+        f.backend.handle(connect(ConnectorKind::Brevo)).await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not implemented")),
+            "{:?}",
+            f.events().last()
+        );
+        assert!(f
+            .store
+            .credentials(shop)
+            .unwrap()
+            .iter()
+            .all(|r| r.kind != ConnectorKind::Brevo.id()));
+        f.backend
+            .handle(Command::ConnectShop {
+                url: "b.test".into(),
+                kind: ConnectorKind::Smtp,
+                credentials: Credentials::new(),
+            })
+            .await;
+        assert!(
+            matches!(f.events().last(), Some(BackendEvent::Error(e)) if e.contains("not added as one"))
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_service_secrets_are_redacted() {
+        let mut f = fixture();
+        f.connect("a.test", Platform::Shopify).await;
+        let shop = f.backend.active_shop_id().unwrap();
+        f.store
+            .save_credentials(
+                shop,
+                &ConnectorKind::Smtp.id(),
+                &Credentials::from([
+                    ("username".into(), "shop@example.com".into()),
+                    ("password".into(), "smtp-pass-123".into()),
+                ]),
+            )
+            .unwrap();
+        f.backend.emit(BackendEvent::Error(
+            "535 auth failed for shop@example.com with smtp-pass-123".into(),
+        ));
+        assert!(matches!(
+            f.events().last(),
+            Some(BackendEvent::Error(e)) if e == "535 auth failed for shop@example.com with [redacted]"
+        ));
+    }
+
+    #[tokio::test]
     async fn error_events_never_contain_saved_secrets() {
         let mut f = fixture();
         f.configure().await;
@@ -2160,8 +2283,8 @@ mod tests {
         f.provider
             .push_tool_call(
                 "c1",
-                "shop_update_order_status",
-                json!({"id": "1", "status": "completed"}),
+                "shop_manage_order",
+                json!({"action": "update_status", "id": "1", "status": "completed"}),
             )
             .push_text("done");
         f.send("complete order 1").await;
@@ -2171,7 +2294,7 @@ mod tests {
         };
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].stage, "failed", "newest first");
-        assert_eq!(rows[1].tool, "shop_update_order_status");
+        assert_eq!(rows[1].tool, "shop_manage_order");
     }
 
     /// Google endpoints for one user with a single client account 1234567890.

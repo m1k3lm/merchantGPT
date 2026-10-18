@@ -70,6 +70,7 @@ pub(crate) fn product(p: &Value) -> Result<Product, ConnectorError> {
     let price = decimal(&p["price"])?;
     let stock = &p["extension_attributes"]["stock_item"];
     Ok(Product {
+        category_ids: Vec::new(),
         id: sku.clone(),
         name: string(&p["name"]).unwrap_or_default(),
         sku: Some(sku),
@@ -138,6 +139,8 @@ pub(crate) fn order(o: &Value) -> Result<Order, ConnectorError> {
 
 pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
     Ok(Customer {
+        phone: None,
+        accepts_marketing: None,
         id: string(&c["id"])
             .ok_or_else(|| ConnectorError::InvalidResponse("customer without id".into()))?,
         email: string(&c["email"]).unwrap_or_default(),

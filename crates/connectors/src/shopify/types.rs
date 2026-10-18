@@ -73,6 +73,7 @@ pub(crate) fn product(v: &Value) -> Result<Product, ConnectorError> {
     let tracked = v["inventoryItem"]["tracked"].as_bool().unwrap_or(false);
     let stock = v["inventoryQuantity"].as_i64().filter(|_| tracked);
     Ok(Product {
+        category_ids: Vec::new(),
         id,
         name,
         sku: string(&v["sku"]),
@@ -145,6 +146,8 @@ pub(crate) fn order(o: &Value) -> Result<Order, ConnectorError> {
 
 pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
     Ok(Customer {
+        phone: None,
+        accepts_marketing: None,
         id: string(&c["id"])
             .ok_or_else(|| ConnectorError::InvalidResponse("customer without id".into()))?,
         email: string(&c["defaultEmailAddress"]["emailAddress"]).unwrap_or_default(),

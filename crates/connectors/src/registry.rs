@@ -21,12 +21,18 @@ const SHOPIFY_HELP: &str = "Use one of two kinds of app. An existing custom app 
 
 const PRESTASHOP_HELP: &str = "In the PrestaShop back office: Advanced Parameters > Webservice, set \"Enable PrestaShop's webservice\" to Yes, then Add new webservice key. Generate a key and give it these resources: products, stock_availables and specific_prices (all methods), orders, order_states, customers and currencies (GET), and order_histories (GET and POST). Updates need PrestaShop 8 or later. Prices are the shop's prices excluding tax.";
 
+const SMTP_HELP: &str = "The mailbox the assistant sends from, for reminders and one-to-one follow-ups. With Gmail or Microsoft 365 use an app password. Send marketing only to customers who opted in.";
+const BREVO_HELP: &str = "In Brevo: your name > SMTP & API > API keys > Generate a new API key. The sender email must be a verified sender in Brevo.";
+const MAILCHIMP_HELP: &str = "In Mailchimp: Profile > Extras > API keys > Create A Key. The part after the dash (e.g. us21) is your data center; the key includes it.";
+const KLAVIYO_HELP: &str = "In Klaviyo: Settings > Account > API keys > Create Private API Key with full access to Lists, Profiles, Campaigns, Templates and Subscriptions.";
+
 impl ConnectorRegistry {
     pub fn kinds() -> Vec<ConnectorKind> {
         Platform::ALL
             .into_iter()
             .map(ConnectorKind::Shop)
             .chain([ConnectorKind::GoogleAds])
+            .chain(ConnectorKind::MAIL)
             .collect()
     }
 
@@ -56,6 +62,34 @@ impl ConnectorRegistry {
                     F::text(g::LOGIN_CUSTOMER_ID, "Manager customer ID").optional(),
                 ])
             }
+            ConnectorKind::Smtp => CredentialSchema::new(vec![
+                F::text("host", "SMTP server, e.g. smtp.gmail.com"),
+                F::text("port", "Port (587 STARTTLS, 465 TLS)").optional(),
+                F::text("security", "Security: starttls (default), tls or none").optional(),
+                F::text("username", "User name"),
+                F::secret("password", "Password or app password"),
+                F::text("from_email", "From address"),
+                F::text("from_name", "From name").optional(),
+            ])
+            .with_help(SMTP_HELP),
+            ConnectorKind::Brevo => CredentialSchema::new(vec![
+                F::secret("api_key", "API key"),
+                F::text("sender_email", "Sender email (verified in Brevo)"),
+                F::text("sender_name", "Sender name").optional(),
+            ])
+            .with_help(BREVO_HELP),
+            ConnectorKind::Mailchimp => CredentialSchema::new(vec![
+                F::secret("api_key", "API key (ends in -usXX)"),
+                F::text("from_name", "From name for campaigns"),
+                F::text("reply_to", "Reply-to email for campaigns"),
+            ])
+            .with_help(MAILCHIMP_HELP),
+            ConnectorKind::Klaviyo => CredentialSchema::new(vec![
+                F::secret("api_key", "Private API key (pk_...)"),
+                F::text("from_email", "From email for campaigns").optional(),
+                F::text("from_name", "From name for campaigns").optional(),
+            ])
+            .with_help(KLAVIYO_HELP),
             ConnectorKind::Shop(Platform::Shopify) => {
                 use crate::shopify as s;
                 CredentialSchema::new(vec![
@@ -86,6 +120,12 @@ impl ConnectorRegistry {
                 missing.join(", ")
             )));
         }
+        if ConnectorKind::MAIL.contains(&kind) {
+            return Err(ConnectorError::NotImplemented(format!(
+                "the {} connector",
+                kind.display_name()
+            )));
+        }
         if kind == ConnectorKind::GoogleAds {
             return Ok(Arc::new(crate::google_ads::GoogleAds::from_credentials(
                 credentials,
@@ -93,7 +133,11 @@ impl ConnectorRegistry {
             )?));
         }
         let shop: Arc<dyn crate::ShopConnector> = match kind {
-            ConnectorKind::GoogleAds => unreachable!("handled above"),
+            ConnectorKind::GoogleAds
+            | ConnectorKind::Smtp
+            | ConnectorKind::Brevo
+            | ConnectorKind::Mailchimp
+            | ConnectorKind::Klaviyo => unreachable!("handled above"),
             ConnectorKind::Shop(Platform::WooCommerce) => {
                 Arc::new(WooCommerce::new(base_url, credentials, transport))
             }

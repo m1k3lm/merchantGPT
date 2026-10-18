@@ -1026,6 +1026,7 @@ mod tests {
             sale_price: sale.map(dec),
             stock_quantity: None,
             stock_status: None,
+            category_ids: Vec::new(),
         };
         let patch = |regular: Option<&str>, sale: Option<&str>| ProductPatch {
             regular_price: regular.map(dec),

@@ -74,6 +74,7 @@ pub(crate) fn product(p: &Value, stock: Option<i64>) -> Result<Product, Connecto
     let price = decimal(&p["final"])?.or(regular);
     let on_sale = matches!((price, regular), (Some(f), Some(r)) if f < r);
     Ok(Product {
+        category_ids: Vec::new(),
         id,
         name: text(&p["name"]).unwrap_or_default(),
         sku: string(&p["reference"]),
@@ -220,6 +221,8 @@ pub(crate) fn order(o: &Value, refs: &OrderRefs) -> Result<Order, ConnectorError
 
 pub(crate) fn customer(c: &Value) -> Result<Customer, ConnectorError> {
     Ok(Customer {
+        phone: None,
+        accepts_marketing: None,
         id: string(&c["id"])
             .ok_or_else(|| ConnectorError::InvalidResponse("customer without id".into()))?,
         email: string(&c["email"]).unwrap_or_default(),

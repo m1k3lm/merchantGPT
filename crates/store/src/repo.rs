@@ -690,7 +690,7 @@ mod tests {
         s.record_audit(&NewAudit {
             shop_id: Some(shop),
             conversation_id: None,
-            tool: "shop_update_product".into(),
+            tool: "shop_manage_product".into(),
             arguments: r#"{"id":"1"}"#.into(),
             stage: "approved".into(),
             detail: None,

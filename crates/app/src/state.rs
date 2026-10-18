@@ -66,6 +66,28 @@ pub struct AppState {
     pub google_sign_in: GoogleSignInState,
 }
 
+/// Calls that remove something for good, so the confirmation card can say so.
+pub fn is_destructive(call: &ToolCall) -> bool {
+    let arg = |k: &str| {
+        call.arguments
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+    };
+    call.name.contains("delete")
+        || arg("action").as_deref() == Some("delete")
+        || (call.name.ends_with("_api_write") && arg("method").as_deref() == Some("delete"))
+}
+
+/// " · Ads · Brevo" for the services linked to a shop.
+pub fn service_badges(connectors: &[connectors::ConnectorKind]) -> String {
+    connectors
+        .iter()
+        .filter(|k| !k.is_shop())
+        .map(|k| format!(" · {}", k.badge()))
+        .collect()
+}
+
 pub fn pretty_args(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
@@ -310,6 +332,53 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn deletes_are_recognised_as_irreversible() {
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments: args,
+        };
+        assert!(is_destructive(&call(
+            "shop_manage_product",
+            serde_json::json!({"action": "delete", "id": "1"})
+        )));
+        assert!(is_destructive(&call(
+            "shop_api_write",
+            serde_json::json!({"method": "DELETE", "path": "/coupons/3"})
+        )));
+        assert!(is_destructive(&call(
+            "memory_delete",
+            serde_json::json!({"id": 1})
+        )));
+        assert!(!is_destructive(&call(
+            "shop_manage_product",
+            serde_json::json!({"action": "update", "id": "1"})
+        )));
+        assert!(!is_destructive(&call(
+            "shop_api_write",
+            serde_json::json!({"method": "POST", "path": "/coupons"})
+        )));
+    }
+
+    #[test]
+    fn badges_list_linked_services_only() {
+        use connectors::{ConnectorKind, Platform};
+        assert_eq!(
+            service_badges(&[
+                ConnectorKind::Shop(Platform::WooCommerce),
+                ConnectorKind::GoogleAds,
+                ConnectorKind::Brevo
+            ]),
+            " · Ads · Brevo"
+        );
+        assert_eq!(
+            service_badges(&[ConnectorKind::Shop(Platform::Magento)]),
+            ""
+        );
+    }
+
     use super::*;
     use serde_json::json;
     use tools::ToolResult;
@@ -366,7 +435,7 @@ mod tests {
         s.apply(BackendEvent::Agent(AgentEvent::ConfirmationRequested {
             call: ToolCall {
                 id: "c".into(),
-                name: "shop_update_product".into(),
+                name: "shop_manage_product".into(),
                 arguments: json!({"id": "1", "regular_price": "9.90"}),
             },
             description: "Update product".into(),

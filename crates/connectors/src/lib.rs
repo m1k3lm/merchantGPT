@@ -32,6 +32,10 @@ pub use transport::{HttpTransport, ReqwestTransport};
 pub enum ConnectorKind {
     Shop(Platform),
     GoogleAds,
+    Smtp,
+    Brevo,
+    Mailchimp,
+    Klaviyo,
 }
 
 impl ConnectorKind {
@@ -39,6 +43,10 @@ impl ConnectorKind {
         match self {
             ConnectorKind::Shop(p) => format!("shop:{}", p.id()),
             ConnectorKind::GoogleAds => "ads:google".into(),
+            ConnectorKind::Smtp => "mail:smtp".into(),
+            ConnectorKind::Brevo => "mail:brevo".into(),
+            ConnectorKind::Mailchimp => "mail:mailchimp".into(),
+            ConnectorKind::Klaviyo => "mail:klaviyo".into(),
         }
     }
 
@@ -47,6 +55,7 @@ impl ConnectorKind {
         match family {
             "shop" => Platform::parse(rest).map(ConnectorKind::Shop),
             "ads" if rest == "google" => Some(ConnectorKind::GoogleAds),
+            "mail" => Self::MAIL.into_iter().find(|k| k.id() == id),
             _ => None,
         }
     }
@@ -55,8 +64,32 @@ impl ConnectorKind {
         match self {
             ConnectorKind::Shop(p) => format!("{} shop", p.display_name()),
             ConnectorKind::GoogleAds => "Google Ads".into(),
+            ConnectorKind::Smtp => "Email (SMTP)".into(),
+            ConnectorKind::Brevo => "Brevo".into(),
+            ConnectorKind::Mailchimp => "Mailchimp".into(),
+            ConnectorKind::Klaviyo => "Klaviyo".into(),
         }
     }
+
+    /// A few letters for the shop list badge.
+    pub fn badge(self) -> &'static str {
+        match self {
+            ConnectorKind::Shop(_) => "",
+            ConnectorKind::GoogleAds => "Ads",
+            ConnectorKind::Smtp => "Mail",
+            ConnectorKind::Brevo => "Brevo",
+            ConnectorKind::Mailchimp => "Mailchimp",
+            ConnectorKind::Klaviyo => "Klaviyo",
+        }
+    }
+
+    /// Email and marketing services, linked to a shop with a plain credential form.
+    pub const MAIL: [ConnectorKind; 4] = [
+        ConnectorKind::Smtp,
+        ConnectorKind::Brevo,
+        ConnectorKind::Mailchimp,
+        ConnectorKind::Klaviyo,
+    ];
 
     pub fn is_shop(self) -> bool {
         matches!(self, ConnectorKind::Shop(_))
@@ -75,6 +108,9 @@ pub trait Connector: Send + Sync {
 pub enum ConnectorError {
     #[error("{0} is not implemented yet")]
     NotImplemented(String),
+    /// The platform's API cannot do this; the message says what to do instead.
+    #[error("{0}")]
+    Unsupported(String),
     #[error("invalid credentials: {0}")]
     InvalidCredentials(String),
     #[error("authentication failed: {0}")]
@@ -109,7 +145,11 @@ mod tests {
             ConnectorKind::parse(&ConnectorKind::GoogleAds.id()),
             Some(ConnectorKind::GoogleAds)
         );
+        for k in ConnectorKind::MAIL {
+            assert_eq!(ConnectorKind::parse(&k.id()), Some(k));
+        }
         assert_eq!(ConnectorKind::parse("ads:bing"), None);
+        assert_eq!(ConnectorKind::parse("mail:pigeon"), None);
         assert_eq!(ConnectorKind::parse("nonsense"), None);
     }
 }

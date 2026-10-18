@@ -90,3 +90,47 @@ DeepSeek = OpenAI codec with `base_url=https://api.deepseek.com`. Hand-written S
 ## Verification
 
 Each phase: the four container commands plus the named tests. End to end after phase 6: configure a provider key in the settings panel, add a WooCommerce shop against the `woo` compose profile (host only, GUI cannot show from the container), ask "list my last 5 orders" and see tool chips stream; ask "set product X price to 10" and see a confirmation card, approve, and find the audit row.
+
+# Phase 2: full merchant operations and retargeting
+
+Requested after the four shop connectors existed: create, modify and delete orders, products, categories, customers, addresses and anything else needed daily, plus reminders and emails for retargeting. Decisions (merchant, 2026-10-18): typed tools plus a raw API escape hatch; real deletes, confirmed, with orders cancelled instead where the platform discourages deleting them (Shopify, Magento); SMTP, Brevo, Mailchimp and Klaviyo connectors, plus the shop platform's own messaging where its API allows; all four platforms in this pass.
+
+## Shared layer (`connectors`)
+
+- Domain additions: `Category`/`CategoryPatch`/`CategoryQuery`; `Address`/`AddressPatch` (country as ISO 3166-1 alpha-2); `CustomerPatch`, `Customer.phone` and `Customer.accepts_marketing`; `NewOrder` (customer or email, line items with optional price, billing/shipping, status, note); `OrderNote { note, notify_customer }`; `Coupon`/`CouponPatch` (kind `percent` | `fixed_cart` | `fixed_product`); `AbandonedCart`; `ProductPatch.description` and `category_ids`, `Product.category_ids`; `RawRequest`/`RawResponse`. Create operations reuse the patch types and require their key field (product name, category name, customer email, coupon code and amount).
+- `ShopConnector` gains methods with default bodies returning `ConnectorError::Unsupported` (distinct from `NotImplemented`, which means a stub connector). `hidden()` lists tools or `tool:action` pairs the platform cannot do, so the model never sees them; `api_hint()` describes the raw API.
+- Tools. Writes are grouped per entity with an `action` argument, so the tool list stays short (each definition costs tokens on every turn) and the confirmation card shows the action:
+  - Read: `shop_list_products`, `shop_get_product`, `shop_list_categories`, `shop_list_orders`, `shop_get_order`, `shop_list_customers`, `shop_get_customer`, `shop_list_addresses`, `shop_list_coupons`, `shop_list_abandoned_carts`, `shop_sales_report`, `shop_api_get`.
+  - Mutate: `shop_manage_product`, `shop_manage_category`, `shop_manage_customer`, `shop_manage_address`, `shop_manage_coupon`, `shop_manage_order` (`create` | `update_status` | `add_note` | `delete`), `shop_api_write`. They replace `shop_update_product` and `shop_update_order_status`.
+  - Raw API: REST platforms take `method`, `path` relative to the API root (no scheme, host or `..`), `query`, `body`; Shopify takes a GraphQL document and variables, and `shop_api_get` refuses a `mutation`. Responses are capped.
+- The confirmation card marks a `delete` action or a raw `DELETE` as irreversible.
+
+## Per platform (verify every endpoint against current docs or the live store; nothing from memory)
+
+| | WooCommerce | Magento 2 | Shopify (GraphQL 2026-10) | PrestaShop 8/9 |
+|---|---|---|---|---|
+| Categories | product categories | `/V1/categories` | custom collections | `categories` (needs `link_rewrite`) |
+| Customers | customers | customers | customers | customers (needs `passwd`) |
+| Addresses | two fixed slots: `billing`, `shipping` | customer addresses | `customerAddress*` mutations | `addresses` (`id_country` from ISO) |
+| Create order | `POST orders` | quote flow: cart, items, shipping info, place order | verify `orderCreate` vs draft order | cart, then order (verify live) |
+| Delete order | real (`force=true`) | hidden: cancel instead | hidden: cancel instead | verify live |
+| Order note to customer | `customer_note` emails the customer | comment with `is_customer_notified` | note only, no notification | verify `customer_threads`/`customer_messages` |
+| Coupons | coupons | sales rule plus coupon | discount codes | `cart_rules` |
+| Abandoned carts | hidden (no core API) | `/V1/carts/search` | `abandonedCheckouts` | carts without an order |
+
+## Messaging connectors (`ConnectorKind` family `mail:`, linked to a shop like Google Ads)
+
+- SMTP (`lettre`, rustls sharing `aws-lc-rs` with reqwest): `email_send`, one message per recipient, capped batch. Live-checked against a `mailpit` compose service.
+- Brevo: lists, upsert contacts into lists, create and send email campaigns, transactional send.
+- Mailchimp: audiences, upsert members (subscriber hash is the md5 of the lowercased email; `status_if_new` is a required argument), create and send campaigns.
+- Klaviyo: lists, subscribe profiles with explicit consent, campaigns (scope to what the current revision allows without a deep template flow, and say so).
+- Consent: marketing messages only to customers who opted in (`accepts_marketing`, or the consent the merchant states); messages about a customer's own order or cart are transactional. Bulk tools take an explicit consent or status argument, never defaulted to "subscribed". The system prompt states the rule.
+- Out of scope, a decision for the merchant: automatic reminders. Scheduled runs use `AutoDeny`, so nothing unattended can send.
+
+## Plumbing
+
+`Command::ConnectService { kind, credentials }` (needs an active shop; build, verify, save, reselect); a URL-less credential form in the `+` flow listing the new services; sidebar badges and "Unlink" entries for every linked service, not only Google Ads.
+
+## Order of work, one commit per step
+
+A. Shared layer and plumbing (all platforms compile with unsupported defaults). B. WooCommerce, live-verified on `woo`. C. PrestaShop, live-verified on `presta`. D. Magento (fakes and wiremock). E. Shopify (fakes and wiremock). F. SMTP (mailpit), Brevo, Mailchimp, Klaviyo (wiremock). G. Docs and the Docker gate with the shop stacks stopped.

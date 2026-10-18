@@ -63,8 +63,8 @@ async fn agent_reads_and_changes_a_live_store() {
         .push_tool_call("c1", "shop_list_orders", json!({"status": "processing"}))
         .push_tool_call(
             "c2",
-            "shop_update_product",
-            json!({"id": hoodie.id, "stock_quantity": new_stock}),
+            "shop_manage_product",
+            json!({"action": "update", "id": hoodie.id, "stock_quantity": new_stock}),
         )
         .push_text("Done: one processing order, stock updated.");
     let events = Arc::new(Mutex::new(Vec::new()));

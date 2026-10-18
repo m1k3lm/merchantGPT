@@ -65,6 +65,7 @@ impl TryFrom<WooProduct> for Product {
     type Error = ConnectorError;
     fn try_from(p: WooProduct) -> Result<Self, ConnectorError> {
         Ok(Product {
+            category_ids: Vec::new(),
             price: money(p.price.as_deref())?,
             regular_price: money(p.regular_price.as_deref())?,
             sale_price: money(p.sale_price.as_deref())?,
@@ -176,6 +177,8 @@ impl TryFrom<WooCustomer> for Customer {
     type Error = ConnectorError;
     fn try_from(c: WooCustomer) -> Result<Self, ConnectorError> {
         Ok(Customer {
+            phone: None,
+            accepts_marketing: None,
             total_spent: money(c.total_spent.as_deref())?,
             id: c.id,
             email: c.email,

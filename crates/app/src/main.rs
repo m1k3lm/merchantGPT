@@ -45,6 +45,11 @@ enum ConnectorFlow {
         values: Credentials,
     },
     GoogleAds(GoogleAdsForm),
+    /// An email or marketing service linked to the active shop.
+    Service {
+        kind: ConnectorKind,
+        values: Credentials,
+    },
 }
 
 #[derive(Default)]
@@ -343,12 +348,11 @@ impl App {
                 }
                 for shop in &self.state.shops {
                     let active = Some(shop.id) == self.state.active_shop;
-                    let has_ads = shop.connectors.contains(&ConnectorKind::GoogleAds);
-                    let label = if has_ads {
-                        format!("{} · Ads", shop.label())
-                    } else {
-                        shop.label()
-                    };
+                    let label = format!(
+                        "{}{}",
+                        shop.label(),
+                        state::service_badges(&shop.connectors)
+                    );
                     let resp = ui
                         .add_enabled(!self.state.busy, egui::Button::selectable(active, label))
                         .on_hover_text(&shop.url);
@@ -356,9 +360,15 @@ impl App {
                         cmds.push(Command::SelectShop(shop.id));
                     }
                     resp.context_menu(|ui| {
-                        if active && has_ads && ui.button("Unlink Google Ads").clicked() {
-                            cmds.push(Command::DisconnectConnector(ConnectorKind::GoogleAds));
-                            ui.close();
+                        for kind in shop.connectors.iter().filter(|k| !k.is_shop()) {
+                            if active
+                                && ui
+                                    .button(format!("Unlink {}", kind.display_name()))
+                                    .clicked()
+                            {
+                                cmds.push(Command::DisconnectConnector(*kind));
+                                ui.close();
+                            }
                         }
                         if ui.button("Remove shop…").clicked() {
                             self.dialog = Dialog::RemoveShop {
@@ -734,7 +744,21 @@ impl App {
                                 ..Default::default()
                             }));
                         }
-                        ui.weak("More connectors (carriers) are coming.");
+                        ui.separator();
+                        ui.label("Email and marketing");
+                        for kind in ConnectorKind::MAIL {
+                            let button = ui
+                                .add_enabled(has_shop, egui::Button::new(kind.display_name()))
+                                .on_disabled_hover_text(
+                                    "Connect a shop first: services are linked to a shop",
+                                );
+                            if button.clicked() {
+                                next = Some(ConnectorFlow::Service {
+                                    kind,
+                                    values: Credentials::new(),
+                                });
+                            }
+                        }
                         if ui.button("Cancel").clicked() {
                             next = Some(ConnectorFlow::Closed);
                         }
@@ -742,6 +766,13 @@ impl App {
             }
             ConnectorFlow::GoogleAds(form) => {
                 let (close, cmd) = google_ads_window(ctx, form, &self.state);
+                connect = cmd;
+                if close {
+                    next = Some(ConnectorFlow::Closed);
+                }
+            }
+            ConnectorFlow::Service { kind, values } => {
+                let (close, cmd) = service_window(ctx, *kind, values);
                 connect = cmd;
                 if close {
                     next = Some(ConnectorFlow::Closed);
@@ -936,6 +967,49 @@ impl App {
 
 /// The Google Ads connector: one-time app setup, then "Sign in with Google",
 /// then the account to link. Returns whether to close and a command to send.
+/// The credential form of an email or marketing service; returns whether to
+/// close and the command to send.
+fn service_window(
+    ctx: &egui::Context,
+    kind: ConnectorKind,
+    values: &mut Credentials,
+) -> (bool, Option<Command>) {
+    let schema = ConnectorRegistry::credential_schema(kind);
+    let (mut close, mut cmd) = (false, None);
+    egui::Window::new(format!("Link {}", kind.display_name()))
+        .resizable(false)
+        .show(ctx, |ui| {
+            for field in schema.fields() {
+                ui.label(field.label);
+                let value = values.entry(field.key.to_string()).or_default();
+                ui.add(egui::TextEdit::singleline(value).password(field.secret));
+            }
+            if let Some(help) = schema.help() {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(help).weak().small()).wrap());
+            }
+            let complete = schema.missing(values).is_empty();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(complete, egui::Button::new("Link"))
+                    .clicked()
+                {
+                    let credentials = values
+                        .iter()
+                        .filter(|(_, v)| !v.trim().is_empty())
+                        .map(|(k, v)| (k.clone(), v.trim().to_string()))
+                        .collect();
+                    cmd = Some(Command::ConnectService { kind, credentials });
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+    (close, cmd)
+}
+
 fn google_ads_window(
     ctx: &egui::Context,
     form: &mut GoogleAdsForm,
@@ -1148,6 +1222,9 @@ fn render_item(
                 .stroke(egui::Stroke::new(1.5, AMBER))
                 .show(ui, |ui| {
                     ui.label(RichText::new(format!("Confirm change: {}", call.name)).strong());
+                    if state::is_destructive(call) {
+                        ui.colored_label(RED, "This deletes permanently and cannot be undone.");
+                    }
                     ui.weak(description);
                     ui.label(RichText::new(pretty_args(&call.arguments)).monospace());
                     match state {
@@ -1224,6 +1301,23 @@ mod tests {
             out.textures_delta.clear();
         }
         result
+    }
+
+    #[test]
+    fn service_form_renders_every_mail_connector() {
+        let ctx = egui::Context::default();
+        for kind in ConnectorKind::MAIL {
+            let mut values = Credentials::new();
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let (close, cmd) = service_window(ui.ctx(), kind, &mut values);
+                    assert!(!close && cmd.is_none());
+                });
+                out.textures_delta.clear();
+            }
+            let schema = ConnectorRegistry::credential_schema(kind);
+            assert_eq!(values.len(), schema.fields().len(), "{kind:?}");
+        }
     }
 
     #[test]
