@@ -1750,6 +1750,20 @@ mod tests {
             query(&carts, "filter[id_customer]").as_deref(),
             Some("[1,999999999]")
         );
+        let range = query(&carts, "filter[date_upd]").unwrap();
+        let until = range
+            .trim_end_matches(']')
+            .split(',')
+            .nth(1)
+            .and_then(|t| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S").ok())
+            .unwrap_or_else(|| panic!("{range}"));
+        let idle = chrono::Local::now().naive_local() - until;
+        assert!(
+            (idle - chrono::Duration::hours(2)).num_seconds().abs() < 60,
+            "carts must be idle for two hours: {range}"
+        );
+        assert!(range.starts_with("[1970-01-01 00:00:00,"));
+        assert_eq!(query(&carts, "date").as_deref(), Some("1"));
     }
 
     #[tokio::test]

@@ -459,13 +459,10 @@ async fn creates_changes_and_deletes_records_on_a_live_store() {
         })
         .await
         .unwrap();
-    let abandoned = carts
-        .items
-        .iter()
-        .find(|c| c.id == cart_id)
-        .unwrap_or_else(|| panic!("cart {cart_id} in {carts:?}"));
-    assert_eq!(abandoned.email.as_deref(), Some(customer.email.as_str()));
-    assert_eq!(abandoned.line_items[0].quantity, 3);
+    assert!(
+        carts.items.iter().all(|c| c.id != cart_id),
+        "a cart changed just now is not abandoned yet: {carts:?}"
+    );
 
     let deleted_cart = shop
         .raw(&RawRequest {

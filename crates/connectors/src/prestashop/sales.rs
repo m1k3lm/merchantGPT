@@ -3,15 +3,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::{Days, Local, NaiveDate};
+use chrono::Local;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
 use super::catalog::line_total;
 use super::xml::{self, Field};
-use super::{
-    bad_request, date_range, list, literal, numeric_id, one_of, paging, types, Params, PrestaShop,
-};
+use super::{bad_request, list, literal, numeric_id, one_of, paging, types, Params, PrestaShop};
 use crate::domain::*;
 use crate::shop::unsupported;
 use crate::transport::Method;
@@ -483,25 +481,32 @@ impl PrestaShop {
         self.delete(&format!("cart_rules/{id}")).await
     }
 
-    /// Carts of known customers, with products, that never became an order.
-    /// Totals use the shop's default prices including tax, without shipping.
+    /// Carts of known customers, with products, that never became an order
+    /// and have been untouched for `ABANDONED_AFTER_HOURS`. PrestaShop keeps
+    /// times in the shop's timezone, which is only readable with access to
+    /// `configurations` (the shop's secrets too), so this computer's local
+    /// time stands in for it. Totals use the shop's default prices including
+    /// tax, without shipping.
     pub(super) async fn abandoned(
         &self,
         q: &CartQuery,
     ) -> Result<Page<AbandonedCart>, ConnectorError> {
+        let idle_since =
+            Local::now().naive_local() - chrono::Duration::hours(ABANDONED_AFTER_HOURS);
+        let from = q.since.map_or("1970-01-01".to_string(), |d| d.to_string());
         let mut params: Params = vec![
             ("display".into(), "full".into()),
             ("filter[id_customer]".into(), "[1,999999999]".into()),
+            (
+                "filter[date_upd]".into(),
+                format!(
+                    "[{from} 00:00:00,{}]",
+                    idle_since.format("%Y-%m-%d %H:%M:%S")
+                ),
+            ),
+            ("date".into(), "1".into()),
             ("sort".into(), "[id_DESC]".into()),
         ];
-        if let Some(since) = q.since {
-            let to: NaiveDate = Local::now()
-                .date_naive()
-                .checked_add_days(Days::new(1))
-                .unwrap_or(since);
-            params.push(("filter[date_upd]".into(), date_range(Some(since), Some(to))));
-            params.push(("date".into(), "1".into()));
-        }
         let (n, size) = paging(&mut params, q.page, q.per_page, super::MAX_PER_PAGE);
         let mut carts = list(&self.get("carts", params).await?, "carts");
         let more = carts.len() > size as usize;
