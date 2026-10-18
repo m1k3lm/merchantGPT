@@ -255,13 +255,14 @@ impl Shopify {
         let mutation = document.trim_start().starts_with("mutation");
         let body = json!({"query": document, "variables": variables});
         let url = format!("{}/admin/api/{API_VERSION}/graphql.json", self.base);
-        let mut renew = false;
+        let (mut renew, mut renewed) = (false, false);
         let mut attempt = 0;
         loop {
             attempt += 1;
             let retry = attempt < MAX_ATTEMPTS;
+            let token = self.token(std::mem::take(&mut renew)).await?;
             let req = HttpRequest::new(Method::Post, &url)
-                .header("X-Shopify-Access-Token", self.token(renew).await?)
+                .header("X-Shopify-Access-Token", token)
                 .header("Accept", "application/json")
                 .json(&body);
             let resp: HttpResponse = match self.transport.send(req).await {
@@ -273,8 +274,8 @@ impl Shopify {
             };
             match resp.status {
                 200..=299 => {}
-                401 if matches!(self.auth, Auth::Client { .. }) && !renew => {
-                    renew = true;
+                401 if matches!(self.auth, Auth::Client { .. }) && !renewed => {
+                    (renew, renewed) = (true, true);
                     continue;
                 }
                 401 | 403 => return Err(ConnectorError::Auth(error_text(&resp.body))),
