@@ -59,13 +59,21 @@ pub(crate) struct WooProduct {
     stock_quantity: Option<i64>,
     #[serde(default, deserialize_with = "opt_string")]
     stock_status: Option<String>,
+    #[serde(default)]
+    categories: Vec<WooRef>,
+}
+
+#[derive(Deserialize)]
+struct WooRef {
+    #[serde(deserialize_with = "id")]
+    id: String,
 }
 
 impl TryFrom<WooProduct> for Product {
     type Error = ConnectorError;
     fn try_from(p: WooProduct) -> Result<Self, ConnectorError> {
         Ok(Product {
-            category_ids: Vec::new(),
+            category_ids: p.categories.into_iter().map(|c| c.id).collect(),
             price: money(p.price.as_deref())?,
             regular_price: money(p.regular_price.as_deref())?,
             sale_price: money(p.sale_price.as_deref())?,
@@ -157,6 +165,80 @@ impl TryFrom<WooOrder> for Order {
     }
 }
 
+/// A customer's `billing` or `shipping` block. Every field is a string and
+/// an unset one is "".
+#[derive(Deserialize, Default)]
+pub(crate) struct WooAddress {
+    #[serde(default)]
+    first_name: String,
+    #[serde(default)]
+    last_name: String,
+    #[serde(default)]
+    company: String,
+    #[serde(default)]
+    address_1: String,
+    #[serde(default)]
+    address_2: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    postcode: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    phone: String,
+}
+
+fn non_empty(s: String) -> Option<String> {
+    Some(s).filter(|s| !s.trim().is_empty())
+}
+
+impl WooAddress {
+    /// The non-empty fields, to copy a saved address into an order.
+    pub(crate) fn as_patch(&self) -> AddressPatch {
+        let f = |s: &String| non_empty(s.clone());
+        AddressPatch {
+            kind: None,
+            first_name: f(&self.first_name),
+            last_name: f(&self.last_name),
+            company: f(&self.company),
+            address1: f(&self.address_1),
+            address2: f(&self.address_2),
+            city: f(&self.city),
+            postcode: f(&self.postcode),
+            state: f(&self.state),
+            country: f(&self.country),
+            phone: f(&self.phone),
+        }
+    }
+
+    /// `None` when the slot holds nothing.
+    pub(crate) fn into_address(self, slot: &str) -> Option<Address> {
+        let a = Address {
+            id: slot.into(),
+            kind: Some(slot.into()),
+            first_name: non_empty(self.first_name),
+            last_name: non_empty(self.last_name),
+            company: non_empty(self.company),
+            address1: non_empty(self.address_1),
+            address2: non_empty(self.address_2),
+            city: non_empty(self.city),
+            postcode: non_empty(self.postcode),
+            state: non_empty(self.state),
+            country: non_empty(self.country),
+            phone: non_empty(self.phone),
+        };
+        let blank = Address {
+            id: a.id.clone(),
+            kind: a.kind.clone(),
+            ..Default::default()
+        };
+        (a != blank).then_some(a)
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct WooCustomer {
     #[serde(deserialize_with = "id")]
@@ -171,13 +253,23 @@ pub(crate) struct WooCustomer {
     orders_count: Option<u64>,
     #[serde(default, deserialize_with = "opt_string")]
     total_spent: Option<String>,
+    #[serde(default)]
+    pub(crate) billing: WooAddress,
+    #[serde(default)]
+    pub(crate) shipping: WooAddress,
+}
+
+impl WooCustomer {
+    pub(crate) fn email(&self) -> Option<&String> {
+        Some(&self.email).filter(|e| !e.trim().is_empty())
+    }
 }
 
 impl TryFrom<WooCustomer> for Customer {
     type Error = ConnectorError;
     fn try_from(c: WooCustomer) -> Result<Self, ConnectorError> {
         Ok(Customer {
-            phone: None,
+            phone: non_empty(c.billing.phone),
             accepts_marketing: None,
             total_spent: money(c.total_spent.as_deref())?,
             id: c.id,
@@ -214,6 +306,81 @@ fn value_u64(v: &Value) -> u64 {
         Value::Number(n) => n.as_u64().unwrap_or(0),
         Value::String(s) => s.trim().parse().unwrap_or(0),
         _ => 0,
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WooCategory {
+    #[serde(deserialize_with = "id")]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, deserialize_with = "opt_string")]
+    parent: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    description: Option<String>,
+    #[serde(default)]
+    count: Option<u64>,
+}
+
+impl TryFrom<WooCategory> for Category {
+    type Error = ConnectorError;
+    fn try_from(c: WooCategory) -> Result<Self, ConnectorError> {
+        Ok(Category {
+            id: c.id,
+            name: c.name,
+            // 0 means a top-level category.
+            parent_id: c.parent.filter(|p| p != "0"),
+            description: c.description,
+            count: c.count,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WooCoupon {
+    #[serde(deserialize_with = "id")]
+    id: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    discount_type: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default, deserialize_with = "opt_string")]
+    date_expires: Option<String>,
+    #[serde(default)]
+    usage_limit: Option<u64>,
+    #[serde(default)]
+    usage_count: Option<u64>,
+    #[serde(default, deserialize_with = "opt_string")]
+    minimum_amount: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    status: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    description: Option<String>,
+}
+
+impl TryFrom<WooCoupon> for Coupon {
+    type Error = ConnectorError;
+    fn try_from(c: WooCoupon) -> Result<Self, ConnectorError> {
+        let expires_on = c
+            .date_expires
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d.get(..10)?, "%Y-%m-%d").ok());
+        Ok(Coupon {
+            id: c.id,
+            code: c.code,
+            kind: c.discount_type,
+            amount: money_or_zero(&c.amount)?,
+            expires_on,
+            usage_limit: c.usage_limit,
+            usage_count: c.usage_count,
+            minimum_amount: money(c.minimum_amount.as_deref())?.filter(|m| !m.is_zero()),
+            // Only a published coupon applies; drafts do not.
+            active: c.status.map(|s| s == "publish"),
+            description: c.description,
+        })
     }
 }
 
