@@ -68,6 +68,52 @@ pub struct AppState {
     pub task_permissions: Vec<String>,
     /// The merchant turned off the refusal of off-topic messages.
     pub scope_guard_off: bool,
+    pub prompts: PromptHistory,
+}
+
+/// Recalls earlier prompts with the arrow keys, like a shell. What was being
+/// typed before the first recall comes back after the newest prompt.
+#[derive(Default)]
+pub struct PromptHistory {
+    entries: Vec<String>,
+    /// Index into `entries` of the prompt shown, while recalling.
+    shown: Option<usize>,
+    draft: String,
+}
+
+impl PromptHistory {
+    /// The prompt before the one shown, or `None` at the oldest.
+    pub fn older(&mut self, current: &str) -> Option<String> {
+        let next = match self.shown {
+            None if self.entries.is_empty() => return None,
+            None => {
+                self.draft = current.to_string();
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(i) => i - 1,
+        };
+        self.shown = Some(next);
+        Some(self.entries[next].clone())
+    }
+
+    /// The prompt after the one shown, then the draft; `None` when not recalling.
+    pub fn newer(&mut self) -> Option<String> {
+        let i = self.shown?;
+        if i + 1 < self.entries.len() {
+            self.shown = Some(i + 1);
+            Some(self.entries[i + 1].clone())
+        } else {
+            self.shown = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+
+    fn record(&mut self, text: &str) {
+        chat_core::prompt_history::remember(&mut self.entries, text);
+        self.shown = None;
+        self.draft.clear();
+    }
 }
 
 /// Calls that remove something for good, so the confirmation card can say so.
@@ -186,6 +232,7 @@ impl AppState {
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
         self.busy = true;
+        self.prompts.record(text);
         self.items.push(ChatItem::User(text.to_string()));
         Some(Command::Send {
             text: text.to_string(),
@@ -269,6 +316,12 @@ impl AppState {
             BackendEvent::TaskPermissions(p) => self.task_permissions = p,
             BackendEvent::Audit(rows) => self.audit = rows,
             BackendEvent::ScopeGuard(on) => self.scope_guard_off = !on,
+            BackendEvent::PromptHistory(entries) => {
+                self.prompts = PromptHistory {
+                    entries,
+                    ..Default::default()
+                }
+            }
             BackendEvent::GoogleAdsApp {
                 configured,
                 client_id,
@@ -510,6 +563,33 @@ mod tests {
         s.cancel_turn();
         assert!(token.is_cancelled());
         assert!(matches!(rx.try_recv().unwrap(), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn arrows_walk_the_prompt_history_and_return_to_the_draft() {
+        let mut s = AppState::default();
+        assert_eq!(s.prompts.older("draft"), None, "nothing to recall yet");
+        s.apply(BackendEvent::PromptHistory(vec![
+            "one".into(),
+            "two".into(),
+        ]));
+        assert_eq!(s.prompts.newer(), None, "not recalling");
+        assert_eq!(s.prompts.older("half typed").as_deref(), Some("two"));
+        assert_eq!(s.prompts.older("two").as_deref(), Some("one"));
+        assert_eq!(s.prompts.older("one"), None, "stays at the oldest");
+        assert_eq!(s.prompts.newer().as_deref(), Some("two"));
+        assert_eq!(s.prompts.newer().as_deref(), Some("half typed"));
+        assert_eq!(s.prompts.newer(), None);
+
+        s.prompts.older("");
+        s.begin_send("one").unwrap();
+        assert_eq!(s.prompts.newer(), None, "sending ends the recall");
+        assert_eq!(
+            s.prompts.older("").as_deref(),
+            Some("one"),
+            "repeats move to the end"
+        );
+        assert_eq!(s.prompts.older("").as_deref(), Some("two"));
     }
 
     #[test]

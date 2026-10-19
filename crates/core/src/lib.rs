@@ -7,6 +7,7 @@ pub mod config;
 pub mod guard;
 pub mod memory;
 pub mod prompt;
+pub mod prompt_history;
 pub mod redact;
 pub mod scheduler;
 

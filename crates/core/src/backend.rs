@@ -186,6 +186,8 @@ pub enum BackendEvent {
     Audit(Vec<AuditSummary>),
     /// Whether off-topic messages are refused before reaching the assistant.
     ScopeGuard(bool),
+    /// Prompts typed before, oldest first, for the arrow keys.
+    PromptHistory(Vec<String>),
     /// Whether the Google Ads app credentials are set up (secrets never sent).
     GoogleAdsApp {
         configured: bool,
@@ -242,6 +244,7 @@ pub struct Backend {
     google_pending: Option<GooglePending>,
     google_built_in: GoogleApp,
     scope_guard: bool,
+    prompts: Vec<String>,
 }
 
 /// A finished Google sign-in waiting for the merchant to pick an account.
@@ -399,7 +402,15 @@ impl Backend {
             google_pending: None,
             google_built_in: GoogleApp::built_in(),
             scope_guard: true,
+            prompts: Vec::new(),
         };
+        backend.prompts = backend
+            .store
+            .app_setting(PROMPT_HISTORY_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
         backend.scope_guard = backend
             .store
             .app_setting(SCOPE_GUARD_SETTING)
@@ -526,6 +537,7 @@ impl Backend {
             Command::SelectShop(id) => self.select_shop(id),
             Command::RemoveShop(id) => self.remove_shop(id),
             Command::Send { text, cancel } => {
+                self.remember_prompt(&text);
                 let error = self.send(text, cancel).await.err();
                 self.emit(BackendEvent::TurnEnded { error });
                 Ok(())
@@ -615,6 +627,7 @@ impl Backend {
     fn init(&mut self) -> Res<()> {
         self.emit_google_app()?;
         self.emit(BackendEvent::ScopeGuard(self.scope_guard));
+        self.emit(BackendEvent::PromptHistory(self.prompts.clone()));
         self.emit(BackendEvent::Skills(
             self.skills
                 .iter()
@@ -1053,6 +1066,15 @@ impl Backend {
         }
     }
 
+    /// Keeps what was typed, before a `/skill` command is expanded. Losing the
+    /// history is no reason to fail the message, so a write error is ignored.
+    fn remember_prompt(&mut self, text: &str) {
+        crate::prompt_history::remember(&mut self.prompts, text);
+        if let Ok(json) = serde_json::to_string(&self.prompts) {
+            let _ = self.store.set_app_setting(PROMPT_HISTORY_SETTING, &json);
+        }
+    }
+
     fn set_scope_guard(&mut self, on: bool) -> Res<()> {
         self.store
             .set_app_setting(SCOPE_GUARD_SETTING, if on { "on" } else { "off" })
@@ -1211,6 +1233,7 @@ fn local_to_rfc3339(t: NaiveDateTime) -> String {
 }
 
 const SCOPE_GUARD_SETTING: &str = "scope_guard";
+const PROMPT_HISTORY_SETTING: &str = "prompt_history";
 
 const UNATTENDED_NOTE: &str = "\n\nThis is a scheduled task running unattended; the merchant is not watching. You cannot change the shop: report what you find and what you would recommend.";
 
@@ -2339,6 +2362,54 @@ mod tests {
             3,
             "skill commands skip the check"
         );
+    }
+
+    #[tokio::test]
+    async fn typed_prompts_are_kept_across_restarts_as_typed() {
+        let store = Store::open_in_memory().unwrap();
+        let mut f = fixture_with(store.clone());
+        f.backend.set_skills(
+            vec![Skill {
+                name: "daily-sales".into(),
+                description: "Morning briefing".into(),
+                body: "Call shop_sales_report for yesterday.".into(),
+                dir: Default::default(),
+                scripts: vec![],
+            }],
+            vec![],
+        );
+        f.configure().await;
+        f.provider
+            .push_text("Hecho")
+            .push_text("Hecho")
+            .push_text("Hecho");
+        f.send("Ventas por provincia de ayer").await;
+        f.send("/daily-sales").await;
+        f.send("  Ventas por provincia de ayer ").await;
+        let user_texts: Vec<String> = f
+            .provider
+            .requests()
+            .iter()
+            .filter_map(|r| match r.messages.last() {
+                Some(ChatMessage::User { text }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(user_texts
+            .iter()
+            .any(|t| t.contains("Call shop_sales_report")));
+
+        let mut restarted = fixture_with(store);
+        restarted.backend.handle(Command::Init).await;
+        let history = restarted
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                BackendEvent::PromptHistory(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(history, ["/daily-sales", "Ventas por provincia de ayer"]);
     }
 
     #[tokio::test]

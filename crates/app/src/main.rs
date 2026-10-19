@@ -11,7 +11,7 @@ use eframe::egui::{self, Color32, RichText};
 use egui_commonmark::CommonMarkCache;
 use llm::{ProviderConfig, ProviderId};
 use runtime::Runtime;
-use state::{pretty_args, AppState, CardState, ChatItem, ToolStatus};
+use state::{pretty_args, AppState, CardState, ChatItem, PromptHistory, ToolStatus};
 use tools::Mutability;
 
 fn main() -> eframe::Result {
@@ -555,11 +555,14 @@ impl App {
                     self.flow = ConnectorFlow::PickConnector;
                 }
                 let width = ui.available_width() - 70.0;
+                let input_id = egui::Id::unique("chat_input");
+                recall_prompt(ui, input_id, &mut self.input, &mut self.state.prompts);
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
+                        .id(input_id)
                         .desired_rows(2)
                         .desired_width(width)
-                        .hint_text("Ask about orders, products, customers, sales… (Shift+Enter for a new line)"),
+                        .hint_text("Ask about orders, products, customers, sales… (Shift+Enter for a new line, ↑ for earlier prompts)"),
                 );
                 let enter = resp.has_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -1379,9 +1382,103 @@ fn render_markdown(ui: &mut egui::Ui, idx: usize, text: &str, cache: &mut Common
     markdown::render(ui, id, text, cache);
 }
 
+/// Up on the input's first line and Down on its last recall earlier prompts;
+/// elsewhere, or with text selected, the arrows move the cursor. Runs before
+/// the input is drawn so it gets the key first.
+fn recall_prompt(ui: &egui::Ui, id: egui::Id, input: &mut String, prompts: &mut PromptHistory) {
+    if !ui.memory(|m| m.has_focus(id)) {
+        return;
+    }
+    let mut edit = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+    let at = match edit.cursor.char_range() {
+        Some(r) if !r.is_empty() => return,
+        Some(r) => r.primary.index.0,
+        None => input.chars().count(),
+    };
+    let on_first_line = !input.chars().take(at).any(|c| c == '\n');
+    let on_last_line = !input.chars().skip(at).any(|c| c == '\n');
+    let pressed = |key| {
+        ui.ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
+    };
+    let recalled = if on_first_line && pressed(egui::Key::ArrowUp) {
+        prompts.older(input)
+    } else if on_last_line && pressed(egui::Key::ArrowDown) {
+        prompts.newer()
+    } else {
+        None
+    };
+    if let Some(text) = recalled {
+        let end = egui::text::CCursor::new(text.chars().count());
+        edit.cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        edit.store(ui.ctx(), id);
+        *input = text;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Draws the chat input for one frame with these key presses.
+    fn frame(
+        ctx: &egui::Context,
+        input: &mut String,
+        prompts: &mut PromptHistory,
+        keys: &[egui::Key],
+    ) {
+        let events = keys
+            .iter()
+            .map(|&key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .collect();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            let id = egui::Id::unique("chat_input");
+            recall_prompt(ui, id, input, prompts);
+            let resp = ui.add(egui::TextEdit::multiline(input).id(id));
+            resp.request_focus();
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn arrow_keys_in_the_input_recall_prompts_only_from_the_edge_lines() {
+        use egui::Key::{ArrowDown, ArrowUp};
+        let ctx = egui::Context::default();
+        let mut state = AppState::default();
+        state.apply(chat_core::BackendEvent::PromptHistory(vec![
+            "ventas de ayer".into(),
+            "pedidos\npendientes".into(),
+        ]));
+        let prompts = &mut state.prompts;
+        let mut input = "borrador".to_string();
+        frame(&ctx, &mut input, prompts, &[]);
+        frame(&ctx, &mut input, prompts, &[]);
+
+        frame(&ctx, &mut input, prompts, &[ArrowUp]);
+        assert_eq!(input, "pedidos\npendientes");
+        // The cursor is at the end, on the second line: Up moves it first.
+        frame(&ctx, &mut input, prompts, &[ArrowUp]);
+        assert_eq!(input, "pedidos\npendientes");
+        frame(&ctx, &mut input, prompts, &[ArrowUp]);
+        assert_eq!(input, "ventas de ayer");
+        frame(&ctx, &mut input, prompts, &[ArrowDown]);
+        assert_eq!(input, "pedidos\npendientes");
+        frame(&ctx, &mut input, prompts, &[ArrowDown]);
+        assert_eq!(input, "borrador");
+        frame(&ctx, &mut input, prompts, &[ArrowDown]);
+        assert_eq!(input, "borrador");
+    }
 
     #[test]
     fn bedrock_form_builds_options_per_auth_mode() {
