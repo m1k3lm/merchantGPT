@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::dsml::DsmlFilter;
 use crate::http::send_with_retry;
 use crate::sse::{decode_stream, sse_events, SseDecoder, SseEvent};
 use crate::{
@@ -149,10 +150,13 @@ pub(crate) struct Decoder {
     calls: BTreeMap<u64, PartialCall>,
     stop: Option<StopReason>,
     done: bool,
+    dsml: DsmlFilter,
+    native_calls: bool,
 }
 
 impl Decoder {
     fn flush_calls(&mut self) -> Vec<StreamEvent> {
+        self.native_calls |= !self.calls.is_empty();
         std::mem::take(&mut self.calls)
             .into_values()
             .map(|c| {
@@ -184,7 +188,10 @@ impl SseDecoder for Decoder {
         if let Some(choice) = v["choices"].get(0) {
             let delta = &choice["delta"];
             if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-                out.push(StreamEvent::TextDelta(text.to_string()));
+                let shown = self.dsml.push(text);
+                if !shown.is_empty() {
+                    out.push(StreamEvent::TextDelta(shown));
+                }
             }
             for tc in delta["tool_calls"].as_array().into_iter().flatten() {
                 let call = self
@@ -226,9 +233,16 @@ impl SseDecoder for Decoder {
         }
         self.done = true;
         let mut out = self.flush_calls();
-        out.push(StreamEvent::Done(
-            self.stop.take().unwrap_or(StopReason::EndTurn),
-        ));
+        let (held, leaked) = self.dsml.finish(self.native_calls);
+        if !held.is_empty() {
+            out.insert(0, StreamEvent::TextDelta(held));
+        }
+        let mut stop = self.stop.take().unwrap_or(StopReason::EndTurn);
+        if !leaked.is_empty() && stop == StopReason::EndTurn {
+            stop = StopReason::ToolUse;
+        }
+        out.extend(leaked.into_iter().map(StreamEvent::ToolCall));
+        out.push(StreamEvent::Done(stop));
         out
     }
 }
@@ -254,6 +268,39 @@ mod tests {
         }
         out.extend(dec.finish());
         out
+    }
+
+    /// DeepSeek V4 can put its tool calls in the text; the stream then
+    /// carries calls instead of markup and stops for tool use.
+    #[test]
+    fn deepseek_tool_calls_leaked_into_text_become_calls() {
+        let chunk = |t: &str| json!({"choices": [{"delta": {"content": t}}]}).to_string();
+        let out = run(&[
+            &chunk("Añado la opción. < ｜｜DSML"),
+            &chunk("｜｜ calls> < ｜｜DSML｜｜ invoke name=\"shop_api_write\"> < ｜｜DSML｜｜ parameter name=\"method\" string=\"true\">POST</｜｜DSML｜｜ parameter>"),
+            &chunk(" </｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>"),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        let text: String = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Añado la opción. ");
+        let calls: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shop_api_write");
+        assert_eq!(calls[0].arguments, json!({"method": "POST"}));
+        assert_eq!(out.last(), Some(&StreamEvent::Done(StopReason::ToolUse)));
     }
 
     #[test]

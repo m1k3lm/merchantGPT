@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+mod dsml;
 pub mod fake;
 pub mod google;
 mod http;
